@@ -26,10 +26,20 @@ for i in range(5):
     sync = renderer.render()
     sync.wait()
 
+    # Single image (grid version)
+    grid = tensor.view(4, 8, 256, 256, 4).permute(0, 2, 1, 3, 4)
+    grid = grid.reshape(256 * 4, 256 * 8, 4)
+
     # Transpose to NCHW
     nchw = tensor.permute(0, 3, 1, 2)
+    grid = grid.permute(2, 0, 1)
+
     # Chop off alpha channel
     rgb = nchw[:, 0:3, :, :]
+    grid = grid[0:3, :, :]
+
+    img = torchvision.transforms.ToPILImage()(grid.cpu())
+    img.save(f"{out_dir}/{i}.png")
 
     for j in range(32):
         img = torchvision.transforms.ToPILImage()(rgb[j].cpu())
