@@ -6,7 +6,7 @@ import os
 
 if len(sys.argv) != 2:
     print("test.py path/to/stokes.glb")
-    os.exit(1)
+    sys.exit(1)
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
 views = script_dir + "/stokes_views"
