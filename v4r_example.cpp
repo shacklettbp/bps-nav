@@ -19,12 +19,13 @@ namespace py = pybind11;
 static vector<glm::mat4> readViews(const string &p);
 
 // Create a tensor that references this memory
-static at::Tensor convertToTensor(void *dev_ptr)
+static at::Tensor convertToTensor(void *dev_ptr, int dev_id)
 {
     array<int64_t, 4> sizes {{32, 256, 256, 4}};
 
     // This would need to be more precise for multi gpu machines
-    auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    auto options = torch::TensorOptions().dtype(torch::kUInt8).
+        device(torch::kCUDA, (short)dev_id);
 
     return torch::from_blob(dev_ptr, sizes, options);
 }
@@ -49,9 +50,9 @@ private:
 
 class V4RExample {
 public:
-    V4RExample(const string &scene_path, const string &views_path)
+    V4RExample(const string &scene_path, const string &views_path, int gpu_id)
         : renderer_({
-              0,  // gpuID
+              gpu_id,  // gpuID
               1,  // numLoaders
               1,  // numStreams
               32, // batchSize
@@ -66,7 +67,7 @@ public:
           }),
           loader_(renderer_.makeLoader()),
           cmd_strm_(renderer_.makeCommandStream()),
-          color_batch_(convertToTensor(cmd_strm_.getColorDevPtr())),
+          color_batch_(convertToTensor(cmd_strm_.getColorDevPtr(), gpu_id)),
           views_(readViews(views_path)),
           loaded_scenes_(),
           view_cnt_(0)
@@ -130,7 +131,7 @@ vector<glm::mat4> readViews(const string &p)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<V4RExample>(m, "V4RExample")
-        .def(py::init<const string &, const string &>())
+        .def(py::init<const string &, const string &, int>())
         .def("render", &V4RExample::render)
         .def("getColorTensor", &V4RExample::getColorTensor);
 

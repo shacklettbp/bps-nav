@@ -4,8 +4,8 @@ import v4r_example
 import sys
 import os
 
-if len(sys.argv) != 2:
-    print("test.py path/to/stokes.glb")
+if len(sys.argv) != 3:
+    print("test.py path/to/stokes.glb GPU_ID")
     sys.exit(1)
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
@@ -13,7 +13,7 @@ views = script_dir + "/stokes_views"
 out_dir = script_dir + "/out"
 os.makedirs(out_dir, exist_ok=True)
 
-renderer = v4r_example.V4RExample(sys.argv[1], views)
+renderer = v4r_example.V4RExample(sys.argv[1], views, int(sys.argv[2]))
 
 print("Initialized and loaded")
 
