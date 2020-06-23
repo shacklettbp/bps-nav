@@ -103,9 +103,9 @@ public:
     }
 
 private:
-    UnlitBatchRenderer renderer_;
-    UnlitBatchRenderer::LoaderType loader_;
-    UnlitBatchRenderer::CommandStreamType cmd_strm_;
+    Unlit::BatchRenderer renderer_;
+    Unlit::AssetLoader loader_;
+    Unlit::CommandStream cmd_strm_;
     at::Tensor color_batch_;
     vector<glm::mat4> views_;
     vector<shared_ptr<Scene>> loaded_scenes_;
