@@ -18,10 +18,12 @@ namespace py = pybind11;
 
 static vector<glm::mat4> readViews(const string &p);
 
+constexpr uint32_t batch_size = 32;
+
 // Create a tensor that references this memory
 static at::Tensor convertToTensor(void *dev_ptr, int dev_id)
 {
-    array<int64_t, 4> sizes {{32, 256, 256, 4}};
+    array<int64_t, 4> sizes {{batch_size, 256, 256, 4}};
 
     // This would need to be more precise for multi gpu machines
     auto options = torch::TensorOptions().dtype(torch::kUInt8).
@@ -55,7 +57,7 @@ public:
               gpu_id,  // gpuID
               1,  // numLoaders
               1,  // numStreams
-              32, // batchSize
+              batch_size, // batchSize
               256, // imgWidth,
               256, // imgHeight
               glm::mat4(
@@ -74,40 +76,41 @@ public:
     {
         loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
 
-        for (int batch_idx = 0; batch_idx < 32; batch_idx++) {
-            cmd_strm_.initState(batch_idx, loaded_scenes_.back(),
-                                90, 0.01, 1000);
+        envs.reserve(batch_size);
+
+        for (uint32_t batch_idx = 0; batch_idx < batch_size; batch_idx++) {
+            envs.emplace_back(move(
+                cmd_strm_.makeEnvironment(loaded_scenes_.back(), 
+                                          90, 0.01, 1000)));
         }
     }
 
     ~V4RExample()
     {
-        for (auto &scene : loaded_scenes_) {
-            loader_.dropScene(move(scene));
-        }
     }
 
     at::Tensor getColorTensor() const { return color_batch_; }
 
     PyTorchSync render()
     {
-        for (int batch_idx = 0; batch_idx < 32; batch_idx++) {
-            cmd_strm_.setCameraView(batch_idx, views_[view_cnt_++]);
+        for (auto &env : envs) {
+            env.setCameraView(views_[view_cnt_++]);
         }
 
-        auto sync = cmd_strm_.render();
+        auto sync = cmd_strm_.render(envs);
 
         return PyTorchSync(move(sync));
     }
 
 private:
-    BatchRenderer renderer_;
-    SceneLoader loader_;
-    CommandStream cmd_strm_;
+    UnlitBatchRenderer renderer_;
+    UnlitBatchRenderer::LoaderType loader_;
+    UnlitBatchRenderer::CommandStreamType cmd_strm_;
     at::Tensor color_batch_;
     vector<glm::mat4> views_;
-    vector<SceneHandle> loaded_scenes_;
+    vector<shared_ptr<Scene>> loaded_scenes_;
     uint64_t view_cnt_;
+    vector<Environment> envs;
 };
 
 vector<glm::mat4> readViews(const string &p)
