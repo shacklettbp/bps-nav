@@ -147,7 +147,7 @@ class SingleBuffered {
               {gpu_id, // gpuID
                1,      // numLoaders
                1,      // numStreams
-               batch_size * 2,
+               batch_size * scene_paths.size(),
                resolution[1],
                resolution[0],
                glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1, -1.19209e-07,
@@ -163,13 +163,15 @@ class SingleBuffered {
           cmd_strm_{renderer_.makeCommandStream()},
           loaded_scenes_(), envs{}, color_batch_{convertToTensor(
                                         cmd_strm_.getColorDevPtr(), gpu_id,
-                                        batch_size * 2, resolution)} {
+                                        batch_size * scene_paths.size(),
+                                        resolution)},
+          batch_size_{batch_size} {
         for (auto &scene_path : scene_paths) {
             loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
         }
 
-        for (int sceneIdx = 0; sceneIdx < 2; ++sceneIdx) {
-            for (uint32_t i = 0; i < batch_size; ++i) {
+        for (uint32_t sceneIdx = 0; sceneIdx < scene_paths.size(); ++sceneIdx) {
+            for (uint32_t i = 0; i < batch_size_; ++i) {
                 envs.emplace_back(move(cmd_strm_.makeEnvironment(
                     loaded_scenes_[sceneIdx], 90, 0.01, 1000)));
             }
@@ -177,6 +179,22 @@ class SingleBuffered {
     }
 
     ~SingleBuffered() = default;
+
+    void swapScenes(const std::vector<std::string> &scene_paths) {
+        envs.clear();
+        loaded_scenes_.clear();
+
+        for (auto &scene_path : scene_paths) {
+            loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
+        }
+
+        for (uint32_t sceneIdx = 0; sceneIdx < scene_paths.size(); ++sceneIdx) {
+            for (uint32_t i = 0; i < batch_size_; ++i) {
+                envs.emplace_back(move(cmd_strm_.makeEnvironment(
+                    loaded_scenes_[sceneIdx], 90, 0.01, 1000)));
+            }
+        }
+    }
 
     at::Tensor getColorTensor() { return color_batch_; }
 
@@ -207,8 +225,8 @@ class SingleBuffered {
     vector<shared_ptr<Scene>> loaded_scenes_;
     vector<Environment> envs;
 
-    vector<std::unique_ptr<V4RRenderGroup>> renderGroups_;
     at::Tensor color_batch_;
+    uint32_t batch_size_;
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -224,5 +242,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<const std::vector<string> &, int, int,
                       const std::vector<uint32_t> &>())
         .def("render", &SingleBuffered::render)
-        .def("rgba", &SingleBuffered::getColorTensor);
+        .def("rgba", &SingleBuffered::getColorTensor)
+        .def("swap_scenes", &SingleBuffered::swapScenes);
 }
