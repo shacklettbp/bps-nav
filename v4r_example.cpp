@@ -170,7 +170,8 @@ class SingleBuffered {
             loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
         }
 
-        for (uint32_t sceneIdx = 0; sceneIdx < scene_paths.size(); ++sceneIdx) {
+        for (uint32_t sceneIdx = 0; sceneIdx < loaded_scenes_.size();
+             ++sceneIdx) {
             for (uint32_t i = 0; i < batch_size_; ++i) {
                 envs.emplace_back(move(cmd_strm_.makeEnvironment(
                     loaded_scenes_[sceneIdx], 90, 0.01, 1000)));
@@ -179,6 +180,21 @@ class SingleBuffered {
     }
 
     ~SingleBuffered() = default;
+
+    void loadNewScene(const std::string &scenePath) {
+        loaded_scenes_.emplace_back(loader_.loadScene(scenePath));
+    }
+
+    void swapScene(const uint32_t dropIdx) {
+        for (uint32_t i = 0; i < batch_size_; ++i) {
+            envs[i + dropIdx * batch_size_] = move(cmd_strm_.makeEnvironment(
+                loaded_scenes_[loaded_scenes_.size() - 1], 90, 0.01, 1000));
+        }
+
+        std::swap(loaded_scenes_[dropIdx],
+                  loaded_scenes_[loaded_scenes_.size() - 1]);
+        loaded_scenes_.pop_back();
+    }
 
     void swapScenes(const std::vector<std::string> &scene_paths) {
         envs.clear();
@@ -243,5 +259,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       const std::vector<uint32_t> &>())
         .def("render", &SingleBuffered::render)
         .def("rgba", &SingleBuffered::getColorTensor)
-        .def("swap_scenes", &SingleBuffered::swapScenes);
+        .def("swap_scenes", &SingleBuffered::swapScenes)
+        .def("load_new_scene", &SingleBuffered::loadNewScene)
+        .def("swap_scene", &SingleBuffered::swapScene);
 }
