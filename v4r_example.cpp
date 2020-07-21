@@ -169,14 +169,9 @@ class SingleBuffered {
                                         cmd_strm_.getColorDevPtr(), gpu_id,
                                         batch_size * scene_paths.size(),
                                         resolution)},
-          batch_size_{batch_size},
-          loader_mutex_(),
-          loader_cv_(),
-          loader_exit_(false),
-          loader_requests_(),
-          loader_thread_([&]() {
-              loaderLoop();
-          }) {
+          batch_size_{batch_size}, loader_mutex_(), loader_cv_(),
+          loader_exit_(false), loader_requests_(),
+          loader_thread_([&]() { loaderLoop(); }) {
         for (auto &scene_path : scene_paths) {
             loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
         }
@@ -200,10 +195,12 @@ class SingleBuffered {
     }
 
     void loadNewScene(const std::string &scenePath) {
-        loaded_scenes_.emplace_back(loader_.loadScene(scenePath));
+        newSceneFuture_ = asyncLoadScene(scenePath);
     }
 
     void swapScene(const uint32_t dropIdx) {
+        newSceneFuture_.wait();
+        loaded_scenes_.emplace_back(newSceneFuture_.get());
         for (uint32_t i = 0; i < batch_size_; ++i) {
             envs[i + dropIdx * batch_size_] = move(cmd_strm_.makeEnvironment(
                 loaded_scenes_[loaded_scenes_.size() - 1], 90, 0.01, 1000));
@@ -275,7 +272,7 @@ class SingleBuffered {
             promise<shared_ptr<Scene>> loader_promise;
             {
                 unique_lock<mutex> wait_lock(loader_mutex_);
-                while (loader_requests_.size() > 0) {
+                while (loader_requests_.size() == 0) {
                     loader_cv_.wait(wait_lock);
                     if (loader_exit_) {
                         return;
@@ -306,6 +303,8 @@ class SingleBuffered {
     bool loader_exit_;
     queue<pair<string, promise<shared_ptr<Scene>>>> loader_requests_;
     thread loader_thread_;
+
+    std::future<shared_ptr<Scene>> newSceneFuture_;
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
