@@ -9,7 +9,11 @@
 #include <v4r.hpp>
 
 #include <array>
+#include <condition_variable>
 #include <fstream>
+#include <future>
+#include <queue>
+#include <utility>
 #include <vector>
 
 using namespace std;
@@ -147,7 +151,7 @@ class SingleBuffered {
               {gpu_id, // gpuID
                1,      // numLoaders
                1,      // numStreams
-               batch_size * scene_paths.size(),
+               batch_size * static_cast<uint32_t>(scene_paths.size()),
                resolution[1],
                resolution[0],
                glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1, -1.19209e-07,
@@ -165,7 +169,14 @@ class SingleBuffered {
                                         cmd_strm_.getColorDevPtr(), gpu_id,
                                         batch_size * scene_paths.size(),
                                         resolution)},
-          batch_size_{batch_size} {
+          batch_size_{batch_size},
+          loader_mutex_(),
+          loader_cv_(),
+          loader_exit_(false),
+          loader_requests_(),
+          loader_thread_([&]() {
+              loaderLoop();
+          }) {
         for (auto &scene_path : scene_paths) {
             loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
         }
@@ -178,7 +189,14 @@ class SingleBuffered {
         }
     }
 
-    ~SingleBuffered() = default;
+    ~SingleBuffered() {
+        {
+            lock_guard<mutex> cv_lock(loader_mutex_);
+            loader_exit_ = true;
+        }
+        loader_cv_.notify_one();
+        loader_thread_.join();
+    }
 
     void swapScenes(const std::vector<std::string> &scene_paths) {
         envs.clear();
@@ -219,6 +237,45 @@ class SingleBuffered {
     }
 
   private:
+    future<shared_ptr<Scene>> asyncLoadScene(const string &scene_path) {
+        future<shared_ptr<Scene>> loader_future;
+
+        {
+            lock_guard<mutex> wait_lock(loader_mutex_);
+
+            promise<shared_ptr<Scene>> loader_promise;
+            loader_future = loader_promise.get_future();
+
+            loader_requests_.emplace(scene_path, move(loader_promise));
+        }
+        loader_cv_.notify_one();
+
+        return loader_future;
+    }
+
+    void loaderLoop() {
+        while (true) {
+            string scene_path;
+            promise<shared_ptr<Scene>> loader_promise;
+            {
+                unique_lock<mutex> wait_lock(loader_mutex_);
+                while (loader_requests_.size() > 0) {
+                    loader_cv_.wait(wait_lock);
+                    if (loader_exit_) {
+                        return;
+                    }
+                }
+
+                scene_path = move(loader_requests_.front().first);
+                loader_promise = move(loader_requests_.front().second);
+                loader_requests_.pop();
+            }
+
+            auto scene = loader_.loadScene(scene_path);
+            loader_promise.set_value(move(scene));
+        }
+    };
+
     BatchRenderer renderer_;
     AssetLoader loader_;
     CommandStream cmd_strm_;
@@ -227,6 +284,12 @@ class SingleBuffered {
 
     at::Tensor color_batch_;
     uint32_t batch_size_;
+
+    mutex loader_mutex_;
+    condition_variable loader_cv_;
+    bool loader_exit_;
+    queue<pair<string, promise<shared_ptr<Scene>>>> loader_requests_;
+    thread loader_thread_;
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
