@@ -21,15 +21,60 @@ using namespace v4r;
 
 namespace py = pybind11;
 
+BatchRenderer makeRenderer(int32_t gpu_id, uint32_t renderer_batch_size,
+                           const std::vector<uint32_t> &resolution, bool color,
+                           bool depth) {
+    RenderFeatures feats;
+    if (color) {
+        feats.colorSrc = RenderFeatures::MeshColor::Texture;
+    } else {
+        feats.colorSrc = RenderFeatures::MeshColor::None;
+    }
+
+    feats.pipeline = RenderFeatures::Pipeline::Unlit;
+
+    if (color) {
+        feats.outputs |= RenderFeatures::Outputs::Color;
+    }
+
+    if (depth) {
+        feats.outputs |= RenderFeatures::Outputs::Depth;
+    }
+
+    return BatchRenderer(
+        {gpu_id, // gpuID
+         1,      // numLoaders
+         1,      // numStreams
+         renderer_batch_size, resolution[1], resolution[0],
+         glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1, -1.19209e-07, 0, 0,
+                   0, 0, 1) // Habitat coordinate txfm matrix
+         ,
+         feats});
+}
+
 // Create a tensor that references this memory
 //
-at::Tensor convertToTensor(void *dev_ptr, int dev_id, uint32_t batch_size,
-                           const std::vector<uint32_t> &resolution) {
+at::Tensor convertToTensorColor(void *dev_ptr, int dev_id, uint32_t batch_size,
+                                const std::vector<uint32_t> &resolution) {
     array<int64_t, 4> sizes{{batch_size, resolution[0], resolution[1], 4}};
 
     // This would need to be more precise for multi gpu machines
     auto options = torch::TensorOptions()
                        .dtype(torch::kUInt8)
+                       .device(torch::kCUDA, (short)dev_id);
+
+    return torch::from_blob(dev_ptr, sizes, options);
+}
+
+// Create a tensor that references this memory
+//
+at::Tensor convertToTensorDepth(void *dev_ptr, int dev_id, uint32_t batch_size,
+                                const std::vector<uint32_t> &resolution) {
+    array<int64_t, 3> sizes{{batch_size, resolution[0], resolution[1]}};
+
+    // This would need to be more precise for multi gpu machines
+    auto options = torch::TensorOptions()
+                       .dtype(torch::kFloat32)
                        .device(torch::kCUDA, (short)dev_id);
 
     return torch::from_blob(dev_ptr, sizes, options);
@@ -54,7 +99,7 @@ struct V4RRenderGroup {
     V4RRenderGroup(CommandStream &strm, std::shared_ptr<Scene> &scene,
                    uint32_t batch_size, int gpu_id,
                    const std::vector<uint32_t> &resolution)
-        : cmd_strm_{strm}, envs{}, color_batch_{convertToTensor(
+        : cmd_strm_{strm}, envs{}, color_batch_{convertToTensorColor(
                                        cmd_strm_.getColorDevPtr(), gpu_id,
                                        batch_size, resolution)} {
         for (uint32_t batch_idx = 0; batch_idx < batch_size; batch_idx++) {
@@ -104,7 +149,8 @@ class DoubleBuffered {
                resolution[1],
                resolution[0],
                glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1, -1.19209e-07,
-                         0, 0, 0, 0, 1) // Habitat coordinate txfm matrix
+                         0, 0, 0, 0,
+                         1) // Habitat coordinate txfm matrix
                ,
                {RenderFeatures::MeshColor::Texture,
                 RenderFeatures::Pipeline::Unlit, RenderFeatures::Outputs::Color,
@@ -146,31 +192,15 @@ class SingleBuffered {
   public:
     SingleBuffered(const std::vector<std::string> &scene_paths,
                    uint32_t batch_size, int gpu_id,
-                   const std::vector<uint32_t> &resolution)
-        : renderer_(
-              {gpu_id, // gpuID
-               1,      // numLoaders
-               1,      // numStreams
-               batch_size * static_cast<uint32_t>(scene_paths.size()),
-               resolution[1],
-               resolution[0],
-               glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1, -1.19209e-07,
-                         0, 0, 0, 0, 1) // Habitat coordinate txfm matrix
-               ,
-               {
-                   RenderFeatures::MeshColor::Texture,
-                   RenderFeatures::Pipeline::Unlit,
-                   RenderFeatures::Outputs::Color,
-                   {},
-               }}),
+                   const std::vector<uint32_t> &resolution, bool color,
+                   bool depth)
+        : renderer_(makeRenderer(
+              gpu_id, batch_size * static_cast<uint32_t>(scene_paths.size()),
+              resolution, color, depth)),
           loader_(renderer_.makeLoader()),
           cmd_strm_{renderer_.makeCommandStream()},
-          loaded_scenes_(), envs{}, color_batch_{convertToTensor(
-                                        cmd_strm_.getColorDevPtr(), gpu_id,
-                                        batch_size * scene_paths.size(),
-                                        resolution)},
-          batch_size_{batch_size}, loader_mutex_(), loader_cv_(),
-          loader_exit_(false), loader_requests_(),
+          loaded_scenes_(), envs{}, batch_size_{batch_size}, loader_mutex_(),
+          loader_cv_(), loader_exit_(false), loader_requests_(),
           loader_thread_([&]() { loaderLoop(); }) {
         for (auto &scene_path : scene_paths) {
             loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
@@ -182,6 +212,18 @@ class SingleBuffered {
                 envs.emplace_back(move(cmd_strm_.makeEnvironment(
                     loaded_scenes_[sceneIdx], 90, 0.01, 1000)));
             }
+        }
+
+        if (color) {
+            color_batch_ = convertToTensorColor(
+                cmd_strm_.getColorDevPtr(), gpu_id,
+                batch_size * scene_paths.size(), resolution);
+        }
+
+        if (depth) {
+            depth_batch_ = convertToTensorDepth(
+                cmd_strm_.getDepthDevPtr(), gpu_id,
+                batch_size * scene_paths.size(), resolution);
         }
     }
 
@@ -228,6 +270,7 @@ class SingleBuffered {
     }
 
     at::Tensor getColorTensor() { return color_batch_; }
+    at::Tensor getDepthTensor() { return depth_batch_; }
 
     PyTorchSync render(const std::vector<at::Tensor> &cameraPoses) {
         AT_ASSERT(cameraPoses.size() == envs.size(),
@@ -296,6 +339,7 @@ class SingleBuffered {
     vector<Environment> envs;
 
     at::Tensor color_batch_;
+    at::Tensor depth_batch_;
     uint32_t batch_size_;
 
     mutex loader_mutex_;
@@ -318,9 +362,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<SingleBuffered>(m, "SingleBuffered")
         .def(py::init<const std::vector<string> &, int, int,
-                      const std::vector<uint32_t> &>())
+                      const std::vector<uint32_t> &, bool, bool>())
         .def("render", &SingleBuffered::render)
         .def("rgba", &SingleBuffered::getColorTensor)
+        .def("depth", &SingleBuffered::getDepthTensor)
         .def("swap_scenes", &SingleBuffered::swapScenes)
         .def("load_new_scene", &SingleBuffered::loadNewScene)
         .def("swap_scene", &SingleBuffered::swapScene);
