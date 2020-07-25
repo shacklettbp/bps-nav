@@ -80,6 +80,10 @@ at::Tensor convertToTensorDepth(void *dev_ptr, int dev_id, uint32_t batch_size,
     return torch::from_blob(dev_ptr, sizes, options);
 }
 
+template <typename R> bool isReady(const std::future<R> &f) {
+    return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
+
 class PyTorchSync {
   public:
     PyTorchSync(RenderSync &&sync) : sync_(move(sync)) {}
@@ -236,21 +240,26 @@ class SingleBuffered {
         loader_thread_.join();
     }
 
+    bool isLoadingNextScene() { return newSceneFuture_.valid(); }
+
+    bool nextSceneReady() {
+        return isLoadingNextScene() && isReady(newSceneFuture_);
+    }
+
     void loadNewScene(const std::string &scenePath) {
+        AT_ASSERT(!isLoadingNextScene(), "Already loading the next scene!");
         newSceneFuture_ = asyncLoadScene(scenePath);
     }
 
     void swapScene(const uint32_t dropIdx) {
         newSceneFuture_.wait();
-        loaded_scenes_.emplace_back(newSceneFuture_.get());
+        auto nextScene = newSceneFuture_.get();
         for (uint32_t i = 0; i < batch_size_; ++i) {
-            envs[i + dropIdx * batch_size_] = move(cmd_strm_.makeEnvironment(
-                loaded_scenes_[loaded_scenes_.size() - 1], 90, 0.01, 1000));
+            envs[i + dropIdx * batch_size_] =
+                move(cmd_strm_.makeEnvironment(nextScene, 90, 0.01, 1000));
         }
 
-        std::swap(loaded_scenes_[dropIdx],
-                  loaded_scenes_[loaded_scenes_.size() - 1]);
-        loaded_scenes_.pop_back();
+        loaded_scenes_[dropIdx] = nextScene;
     }
 
     void swapScenes(const std::vector<std::string> &scene_paths) {
@@ -272,18 +281,20 @@ class SingleBuffered {
     at::Tensor getColorTensor() { return color_batch_; }
     at::Tensor getDepthTensor() { return depth_batch_; }
 
-    PyTorchSync render(const std::vector<at::Tensor> &cameraPoses) {
-        AT_ASSERT(cameraPoses.size() == envs.size(),
+    PyTorchSync render(at::Tensor cameraPoses) {
+        AT_ASSERT(static_cast<std::size_t>(cameraPoses.size(0)) == envs.size(),
                   "Must have the same number of camera poses as batch_size");
+        AT_ASSERT(!cameraPoses.is_cuda(), "Must be on CPU");
+
         {
-            int i = 0;
-            for (auto &env : envs) {
-                AT_ASSERT(!cameraPoses[i].is_cuda(), "Must be on CPU");
-                AT_ASSERT(cameraPoses[i].scalar_type() == at::ScalarType::Float,
-                          "Must be float32");
-                glm::mat4 pose = glm::transpose(
-                    (glm::make_mat4(cameraPoses[i++].data_ptr<float>())));
-                env.setCameraView(pose);
+            auto posesAccessor = cameraPoses.accessor<float, 3>();
+            for (uint32_t envIdx = 0; envIdx < envs.size(); ++envIdx) {
+                glm::mat4 pose;
+                for (int j = 0; j < 4; ++j)
+                    for (int i = 0; i < 4; ++i)
+                        pose[i][j] = posesAccessor[envIdx][j][i];
+
+                envs[envIdx].setCameraView(pose);
             }
         }
 
@@ -368,5 +379,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("depth", &SingleBuffered::getDepthTensor)
         .def("swap_scenes", &SingleBuffered::swapScenes)
         .def("load_new_scene", &SingleBuffered::loadNewScene)
-        .def("swap_scene", &SingleBuffered::swapScene);
+        .def("swap_scene", &SingleBuffered::swapScene)
+        .def("next_scene_ready", &SingleBuffered::nextSceneReady)
+        .def("is_loading_next_scene", &SingleBuffered::isLoadingNextScene);
 }
