@@ -24,36 +24,34 @@ namespace py = pybind11;
 BatchRenderer makeRenderer(int32_t gpu_id, uint32_t renderer_batch_size,
                            const std::vector<uint32_t> &resolution, bool color,
                            bool depth, bool doubleBuffered) {
-    RenderFeatures feats;
-    if (color) {
-        feats.colorSrc = RenderFeatures::MeshColor::Texture;
-    } else {
-        feats.colorSrc = RenderFeatures::MeshColor::None;
-    }
-
-    feats.pipeline = RenderFeatures::Pipeline::Unlit;
-
-    if (color) {
-        feats.outputs |= RenderFeatures::Outputs::Color;
-    }
-
-    if (depth) {
-        feats.outputs |= RenderFeatures::Outputs::Depth;
-    }
-
+    RenderOptions options {};
     if (doubleBuffered) {
-        feats.options |= RenderFeatures::Options::DoubleBuffered;
+        options |= RenderOptions::DoubleBuffered;
     }
 
-    return BatchRenderer(
-        {gpu_id, // gpuID
-         1,      // numLoaders
-         1,      // numStreams
-         renderer_batch_size, resolution[1], resolution[0],
-         glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1, -1.19209e-07, 0, 0,
-                   0, 0, 1) // Habitat coordinate txfm matrix
-         ,
-         feats});
+    auto make = [&](auto features) {
+        return BatchRenderer(
+            {gpu_id, // gpuID
+             1,      // numLoaders
+             1,      // numStreams
+             renderer_batch_size, resolution[1], resolution[0],
+             glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1, -1.19209e-07, 0, 0,
+                       0, 0, 1) // Habitat coordinate txfm matrix
+             ,
+             }, features);
+    };
+
+    if (color && depth) {
+        return make(RenderFeatures<Unlit<RenderOutputs::Color | RenderOutputs::Depth,
+                                   DataSource::Texture>> { options });
+    } else if (color) {
+        return make(RenderFeatures<Unlit<RenderOutputs::Color,
+                                   DataSource::Texture>> { options });
+    } else {
+        return make(RenderFeatures<Unlit<RenderOutputs::Depth,
+                                   DataSource::None>> { options });
+    }
+
 }
 
 // Create a tensor that references this memory

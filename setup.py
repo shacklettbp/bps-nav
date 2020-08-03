@@ -2,7 +2,7 @@ from setuptools import setup, Extension
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 v4r_path = "/nethome/ewijmans3/projects/fast-rl-renderer/v4r"
-include_dir = v4r_path + "/include"
+include_dir = v4r_path + "/build/include"
 lib_dir = v4r_path + "/build/src"
 
 setup(
