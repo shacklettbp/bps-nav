@@ -23,7 +23,7 @@ namespace py = pybind11;
 
 BatchRenderer makeRenderer(int32_t gpu_id, uint32_t renderer_batch_size,
                            const std::vector<uint32_t> &resolution, bool color,
-                           bool depth) {
+                           bool depth, bool doubleBuffered) {
     RenderFeatures feats;
     if (color) {
         feats.colorSrc = RenderFeatures::MeshColor::Texture;
@@ -39,6 +39,10 @@ BatchRenderer makeRenderer(int32_t gpu_id, uint32_t renderer_batch_size,
 
     if (depth) {
         feats.outputs |= RenderFeatures::Outputs::Depth;
+    }
+
+    if (doubleBuffered) {
+        feats.options |= RenderFeatures::Options::DoubleBuffered;
     }
 
     return BatchRenderer(
@@ -99,139 +103,14 @@ class PyTorchSync {
     RenderSync sync_;
 };
 
-struct V4RRenderGroup {
-    V4RRenderGroup(CommandStream &strm, std::shared_ptr<Scene> &scene,
-                   uint32_t batch_size, int gpu_id,
-                   const std::vector<uint32_t> &resolution)
-        : cmd_strm_{strm}, envs{}, color_batch_{convertToTensorColor(
-                                       cmd_strm_.getColorDevPtr(), gpu_id,
-                                       batch_size, resolution)} {
-        for (uint32_t batch_idx = 0; batch_idx < batch_size; batch_idx++) {
-            envs.emplace_back(
-                move(cmd_strm_.makeEnvironment(scene, 90, 0.01, 1000)));
-        }
-    }
+struct BackgroundSceneLoader {
+    explicit BackgroundSceneLoader(AssetLoader &&loader)
+        : loader_{std::move(loader)}, loader_mutex_{}, loader_cv_{},
+          loader_exit_{false}, loader_requests_{}, loader_thread_{[&]() {
+              loaderLoop();
+          }} {};
 
-    PyTorchSync render(const std::vector<at::Tensor> &cameraPoses) {
-        AT_ASSERT(cameraPoses.size() == envs.size(),
-                  "Must have the same number of camera poses as batch_size");
-        {
-            int i = 0;
-            for (auto &env : envs) {
-                AT_ASSERT(!cameraPoses[i].is_cuda(), "Must be on CPU");
-                AT_ASSERT(cameraPoses[i].scalar_type() == at::ScalarType::Float,
-                          "Must be float32");
-                glm::mat4 pose = glm::transpose(
-                    (glm::make_mat4(cameraPoses[i++].data_ptr<float>())));
-                env.setCameraView(pose);
-            }
-        }
-
-        auto sync = cmd_strm_.render(envs);
-
-        return PyTorchSync(move(sync));
-    }
-
-  private:
-    CommandStream &cmd_strm_;
-    vector<Environment> envs;
-
-  public:
-    at::Tensor color_batch_;
-};
-
-class DoubleBuffered {
-  public:
-    DoubleBuffered(const std::vector<std::string> &scene_paths,
-                   uint32_t batch_size, int gpu_id,
-                   const std::vector<uint32_t> &resolution)
-        : renderer_(
-              {gpu_id, // gpuID
-               1,      // numLoaders
-               1,      // numStreams
-               batch_size,
-               resolution[1],
-               resolution[0],
-               glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1, -1.19209e-07,
-                         0, 0, 0, 0,
-                         1) // Habitat coordinate txfm matrix
-               ,
-               {RenderFeatures::MeshColor::Texture,
-                RenderFeatures::Pipeline::Unlit, RenderFeatures::Outputs::Color,
-                RenderFeatures::Options::CpuSynchronization |
-                    RenderFeatures::Options::DoubleBuffered}}),
-          loader_(renderer_.makeLoader()),
-          cmd_strm_{renderer_.makeCommandStream()}, loaded_scenes_() {
-        for (auto &scene_path : scene_paths) {
-            loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
-        }
-
-        for (int i = 0; i < 2; ++i) {
-            renderGroups_.emplace_back(new V4RRenderGroup(
-                cmd_strm_, loaded_scenes_[i], batch_size, gpu_id, resolution));
-        }
-    }
-
-    ~DoubleBuffered() = default;
-
-    at::Tensor getColorTensor(const uint32_t groupIdx) const {
-        return renderGroups_[groupIdx]->color_batch_;
-    }
-
-    PyTorchSync render(const std::vector<at::Tensor> &cameraPoses,
-                       const uint32_t groupIdx) {
-        return std::move(renderGroups_[groupIdx]->render(cameraPoses));
-    }
-
-  private:
-    BatchRenderer renderer_;
-    AssetLoader loader_;
-    CommandStream cmd_strm_;
-    vector<shared_ptr<Scene>> loaded_scenes_;
-
-    vector<std::unique_ptr<V4RRenderGroup>> renderGroups_;
-};
-
-class SingleBuffered {
-  public:
-    SingleBuffered(const std::vector<std::string> &scene_paths,
-                   uint32_t batch_size, int gpu_id,
-                   const std::vector<uint32_t> &resolution, bool color,
-                   bool depth)
-        : renderer_(makeRenderer(
-              gpu_id, batch_size * static_cast<uint32_t>(scene_paths.size()),
-              resolution, color, depth)),
-          loader_(renderer_.makeLoader()),
-          cmd_strm_{renderer_.makeCommandStream()},
-          loaded_scenes_(), envs{}, batch_size_{batch_size}, loader_mutex_(),
-          loader_cv_(), loader_exit_(false), loader_requests_(),
-          loader_thread_([&]() { loaderLoop(); }) {
-        for (auto &scene_path : scene_paths) {
-            loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
-        }
-
-        for (uint32_t sceneIdx = 0; sceneIdx < loaded_scenes_.size();
-             ++sceneIdx) {
-            for (uint32_t i = 0; i < batch_size_; ++i) {
-                envs.emplace_back(move(cmd_strm_.makeEnvironment(
-                    loaded_scenes_[sceneIdx], 90, 0.01, 1000)));
-            }
-        }
-
-        if (color) {
-            color_batch_ = convertToTensorColor(
-                cmd_strm_.getColorDevPtr(), gpu_id,
-                batch_size * scene_paths.size(), resolution);
-        }
-
-        if (depth) {
-            depth_batch_ = convertToTensorDepth(
-                cmd_strm_.getDepthDevPtr(), gpu_id,
-                batch_size * scene_paths.size(), resolution);
-        }
-    }
-
-    ~SingleBuffered() {
+    ~BackgroundSceneLoader() {
         {
             lock_guard<mutex> cv_lock(loader_mutex_);
             loader_exit_ = true;
@@ -240,70 +119,12 @@ class SingleBuffered {
         loader_thread_.join();
     }
 
-    bool isLoadingNextScene() { return newSceneFuture_.valid(); }
-
-    bool nextSceneReady() {
-        return isLoadingNextScene() && isReady(newSceneFuture_);
+    std::shared_ptr<Scene> loadScene(const std::string &scene_path) {
+        auto fut = asyncLoadScene(scene_path);
+        fut.wait();
+        return fut.get();
     }
 
-    void loadNewScene(const std::string &scenePath) {
-        AT_ASSERT(!isLoadingNextScene(), "Already loading the next scene!");
-        newSceneFuture_ = asyncLoadScene(scenePath);
-    }
-
-    void swapScene(const uint32_t dropIdx) {
-        newSceneFuture_.wait();
-        auto nextScene = newSceneFuture_.get();
-        for (uint32_t i = 0; i < batch_size_; ++i) {
-            envs[i + dropIdx * batch_size_] =
-                move(cmd_strm_.makeEnvironment(nextScene, 90, 0.01, 1000));
-        }
-
-        loaded_scenes_[dropIdx] = nextScene;
-    }
-
-    void swapScenes(const std::vector<std::string> &scene_paths) {
-        envs.clear();
-        loaded_scenes_.clear();
-
-        for (auto &scene_path : scene_paths) {
-            loaded_scenes_.emplace_back(loader_.loadScene(scene_path));
-        }
-
-        for (uint32_t sceneIdx = 0; sceneIdx < scene_paths.size(); ++sceneIdx) {
-            for (uint32_t i = 0; i < batch_size_; ++i) {
-                envs.emplace_back(move(cmd_strm_.makeEnvironment(
-                    loaded_scenes_[sceneIdx], 90, 0.01, 1000)));
-            }
-        }
-    }
-
-    at::Tensor getColorTensor() { return color_batch_; }
-    at::Tensor getDepthTensor() { return depth_batch_; }
-
-    PyTorchSync render(at::Tensor cameraPoses) {
-        AT_ASSERT(static_cast<std::size_t>(cameraPoses.size(0)) == envs.size(),
-                  "Must have the same number of camera poses as batch_size");
-        AT_ASSERT(!cameraPoses.is_cuda(), "Must be on CPU");
-
-        {
-            auto posesAccessor = cameraPoses.accessor<float, 3>();
-            for (uint32_t envIdx = 0; envIdx < envs.size(); ++envIdx) {
-                glm::mat4 pose;
-                for (int j = 0; j < 4; ++j)
-                    for (int i = 0; i < 4; ++i)
-                        pose[i][j] = posesAccessor[envIdx][j][i];
-
-                envs[envIdx].setCameraView(pose);
-            }
-        }
-
-        auto sync = cmd_strm_.render(envs);
-
-        return PyTorchSync(move(sync));
-    }
-
-  private:
     future<shared_ptr<Scene>> asyncLoadScene(const string &scene_path) {
         future<shared_ptr<Scene>> loader_future;
 
@@ -320,6 +141,7 @@ class SingleBuffered {
         return loader_future;
     }
 
+  private:
     void loaderLoop() {
         while (true) {
             string scene_path;
@@ -343,23 +165,193 @@ class SingleBuffered {
         }
     };
 
-    BatchRenderer renderer_;
     AssetLoader loader_;
-    CommandStream cmd_strm_;
-    vector<shared_ptr<Scene>> loaded_scenes_;
-    vector<Environment> envs;
-
-    at::Tensor color_batch_;
-    at::Tensor depth_batch_;
-    uint32_t batch_size_;
 
     mutex loader_mutex_;
     condition_variable loader_cv_;
     bool loader_exit_;
     queue<pair<string, promise<shared_ptr<Scene>>>> loader_requests_;
     thread loader_thread_;
+};
 
+struct V4RRenderGroup {
+    V4RRenderGroup(CommandStream &strm, std::vector<Environment> &&envs,
+                   uint32_t batch_size_per_scene, at::Tensor color,
+                   at::Tensor depth)
+
+        : cmd_strm_{strm}, envs_{std::move(envs)},
+          batch_size_per_scene_{batch_size_per_scene}, color_batch_{color},
+          depth_batch_{depth} {}
+
+    PyTorchSync render(at::Tensor cameraPoses) {
+        AT_ASSERT(static_cast<std::size_t>(cameraPoses.size(0)) == envs_.size(),
+                  "Must have the same number of camera poses as "
+                  "envs per group");
+        AT_ASSERT(!cameraPoses.is_cuda(), "Must be on CPU");
+
+        {
+            auto posesAccessor = cameraPoses.accessor<float, 3>();
+            for (uint32_t envIdx = 0; envIdx < envs_.size(); ++envIdx) {
+                glm::mat4 pose;
+                for (int j = 0; j < 4; ++j)
+                    for (int i = 0; i < 4; ++i)
+                        pose[i][j] = posesAccessor[envIdx][j][i];
+
+                envs_[envIdx].setCameraView(pose);
+            }
+        }
+
+        auto sync = cmd_strm_.render(envs_);
+
+        return PyTorchSync(move(sync));
+    }
+
+    void swapScene(const uint32_t envIdx, std::shared_ptr<Scene> &nextScene) {
+        envs_[envIdx] = cmd_strm_.makeEnvironment(nextScene, 90, 0.01, 1000);
+    }
+
+  private:
+    CommandStream &cmd_strm_;
+    vector<Environment> envs_;
+    const uint32_t batch_size_per_scene_;
+
+  public:
+    at::Tensor color_batch_, depth_batch_;
+};
+
+class DoubleBuffered {
+  public:
+    DoubleBuffered(BatchRenderer &&renderer, uint32_t numGroups,
+                   const std::vector<std::string> &scene_paths,
+                   uint32_t batch_size_per_scene, int gpu_id,
+                   const std::vector<uint32_t> &resolution, bool color,
+                   bool depth)
+        : renderer_{std::move(renderer)}, loader_{renderer_.makeLoader()},
+          cmd_strm_{renderer_.makeCommandStream()},
+          numScenes_{scene_paths.size()},
+          batch_size_per_scene_{batch_size_per_scene},
+          envsPerGroup_{numScenes_ * batch_size_per_scene_ / numGroups},
+          renderGroups_{} {
+
+        for (uint32_t i = 0, sceneIdx = 0; i < numGroups; ++i) {
+            std::vector<Environment> envs;
+            for (uint32_t __i = 0; __i < scene_paths.size() / numGroups;
+                 ++__i, ++sceneIdx) {
+
+                auto scene = loader_.loadScene(scene_paths[sceneIdx]);
+                for (uint32_t __j = 0; __j < batch_size_per_scene; ++__j)
+                    envs.emplace_back(
+                        move(cmd_strm_.makeEnvironment(scene, 90, 0.01, 1000)));
+            }
+
+            at::Tensor color_batch, depth_batch;
+
+            if (color) {
+                color_batch =
+                    convertToTensorColor(cmd_strm_.getColorDevPtr(i), gpu_id,
+                                         envs.size(), resolution);
+            }
+
+            if (depth) {
+                depth_batch =
+                    convertToTensorDepth(cmd_strm_.getDepthDevPtr(i), gpu_id,
+                                         envs.size(), resolution);
+            }
+
+            renderGroups_.emplace_back(new V4RRenderGroup(
+                cmd_strm_, std::move(envs), batch_size_per_scene, color_batch,
+                depth_batch));
+        }
+    }
+
+    DoubleBuffered(const std::vector<std::string> &scene_paths,
+                   uint32_t batch_size_per_scene, int gpu_id,
+                   const std::vector<uint32_t> &resolution, bool color,
+                   bool depth)
+        : DoubleBuffered{
+              makeRenderer(gpu_id,
+                           batch_size_per_scene *
+                               static_cast<uint32_t>(scene_paths.size()) / 2,
+                           resolution, color, depth, /*doubleBuffered=*/true),
+              2,
+              scene_paths,
+              batch_size_per_scene,
+              gpu_id,
+              resolution,
+              color,
+              depth} {};
+
+    ~DoubleBuffered() = default;
+
+    at::Tensor getColorTensor(const uint32_t groupIdx) const {
+        return renderGroups_[groupIdx]->color_batch_;
+    }
+
+    at::Tensor getDepthTensor(const uint32_t groupIdx) const {
+        return renderGroups_[groupIdx]->depth_batch_;
+    }
+
+    PyTorchSync render(at::Tensor cameraPoses, const uint32_t groupIdx) {
+        return std::move(renderGroups_[groupIdx]->render(cameraPoses));
+    }
+
+    bool isLoadingNextScene() {
+        return nextScene_ != nullptr || newSceneFuture_.valid();
+    }
+
+    bool nextSceneLoaded() {
+        return newSceneFuture_.valid() && isReady(newSceneFuture_);
+    }
+
+    void loadNewScene(const std::string &scenePath) {
+        AT_ASSERT(!isLoadingNextScene(), "Already loading the next scene!");
+        newSceneFuture_ = loader_.asyncLoadScene(scenePath);
+    }
+
+    bool hasNextScene() { return nextScene_ != nullptr; }
+
+    void acquireNextScene() {
+        newSceneFuture_.wait();
+        nextScene_ = newSceneFuture_.get();
+    }
+
+    void doneSwappingScene() { nextScene_ = nullptr; }
+
+    void swapScene(const uint32_t envIdx, const uint32_t groupIdx) {
+        AT_ASSERT(hasNextScene(), "Next scene is nullptr");
+
+        renderGroups_[groupIdx]->swapScene(envIdx, nextScene_);
+    }
+
+  private:
+    BatchRenderer renderer_;
+    BackgroundSceneLoader loader_;
+    CommandStream cmd_strm_;
+    const uint32_t numScenes_, batch_size_per_scene_, envsPerGroup_;
+
+    vector<std::unique_ptr<V4RRenderGroup>> renderGroups_;
     std::future<shared_ptr<Scene>> newSceneFuture_;
+    std::shared_ptr<Scene> nextScene_ = nullptr;
+};
+
+class SingleBuffered : public DoubleBuffered {
+  public:
+    SingleBuffered(const std::vector<std::string> &scene_paths,
+                   uint32_t batch_size_per_scene, int gpu_id,
+                   const std::vector<uint32_t> &resolution, bool color,
+                   bool depth)
+        : DoubleBuffered{
+              makeRenderer(gpu_id,
+                           batch_size_per_scene *
+                               static_cast<uint32_t>(scene_paths.size()),
+                           resolution, color, depth, /*doubleBuffered=*/false),
+              1,
+              scene_paths,
+              batch_size_per_scene,
+              gpu_id,
+              resolution,
+              color,
+              depth} {};
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -367,19 +359,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<DoubleBuffered>(m, "DoubleBuffered")
         .def(py::init<const std::vector<string> &, int, int,
-                      const std::vector<uint32_t> &>())
-        .def("render", &DoubleBuffered::render)
-        .def("rgba", &DoubleBuffered::getColorTensor);
-
-    py::class_<SingleBuffered>(m, "SingleBuffered")
-        .def(py::init<const std::vector<string> &, int, int,
                       const std::vector<uint32_t> &, bool, bool>())
-        .def("render", &SingleBuffered::render)
-        .def("rgba", &SingleBuffered::getColorTensor)
-        .def("depth", &SingleBuffered::getDepthTensor)
-        .def("swap_scenes", &SingleBuffered::swapScenes)
-        .def("load_new_scene", &SingleBuffered::loadNewScene)
-        .def("swap_scene", &SingleBuffered::swapScene)
-        .def("next_scene_ready", &SingleBuffered::nextSceneReady)
-        .def("is_loading_next_scene", &SingleBuffered::isLoadingNextScene);
+        .def("render", &DoubleBuffered::render)
+        .def("rgba", &DoubleBuffered::getColorTensor)
+        .def("depth", &DoubleBuffered::getDepthTensor)
+        .def("done_swapping_scenes", &DoubleBuffered::doneSwappingScene)
+        .def("acquire_next_scene", &DoubleBuffered::acquireNextScene)
+        .def("load_new_scene", &DoubleBuffered::loadNewScene)
+        .def("swap_scene", &DoubleBuffered::swapScene)
+        .def("next_scene_loaded", &DoubleBuffered::nextSceneLoaded)
+        .def("has_next_scene", &DoubleBuffered::hasNextScene)
+        .def("is_loading_next_scene", &DoubleBuffered::isLoadingNextScene);
+
+    py::class_<SingleBuffered, DoubleBuffered>(m, "SingleBuffered")
+        .def(py::init<const std::vector<string> &, int, int,
+                      const std::vector<uint32_t> &, bool, bool>());
 }
