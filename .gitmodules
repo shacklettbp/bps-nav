@@ -1,0 +1,9 @@
+[submodule "external/v4r"]
+	path = external/v4r
+	url = git@github.com:shacklettbp/v4r.git
+[submodule "external/habitat-sim-geodesic"]
+	path = external/habitat-sim-geodesic
+	url = git@github.com:erikwijmans/habitat-sim-geodesic.git
+[submodule "external/pybind11"]
+	path = external/pybind11
+	url = https://github.com/pybind/pybind11.git
