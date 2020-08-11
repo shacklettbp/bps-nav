@@ -10,3 +10,5 @@ set(CMAKE_CXX_STANDARD_REQUIRED 17)
 add_subdirectory(external)
 
 pybind11_add_module(ddppo_fastrollout fastrollout.cpp)
+add_dependencies(ddppo_fastrollout v4r_headless habitat_sim_geodesic)
+target_link_libraries(ddppo_fastrollout PRIVATE v4r_headless habitat_sim_geodesic)

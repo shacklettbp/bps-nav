@@ -1,4 +1,4 @@
-#include <v4r.hpp>
+#include <v4r/cuda.hpp>
 #include <PathFinder.h>
 #include <pybind11/pybind11.h>
 
@@ -16,16 +16,16 @@ using namespace std;
 using namespace v4r;
 namespace py = pybind11;
 
-BatchRenderer makeRenderer(int32_t gpu_id, uint32_t renderer_batch_size,
-                           const std::vector<uint32_t> &resolution, bool color,
-                           bool depth, bool doubleBuffered) {
+BatchRendererCUDA makeRenderer(int32_t gpu_id, uint32_t renderer_batch_size,
+                               const std::vector<uint32_t> &resolution, bool color,
+                               bool depth, bool doubleBuffered) {
     RenderOptions options {};
     if (doubleBuffered) {
         options |= RenderOptions::DoubleBuffered;
     }
 
     auto make = [&](auto features) {
-        return BatchRenderer(
+        return BatchRendererCUDA(
             {gpu_id, // gpuID
              1,      // numLoaders
              1,      // numStreams
@@ -127,7 +127,7 @@ struct BackgroundSceneLoader {
 };
 
 struct V4RRenderGroup {
-    V4RRenderGroup(CommandStream &strm, std::vector<Environment> &&envs,
+    V4RRenderGroup(CommandStreamCUDA &strm, std::vector<Environment> &&envs,
                    uint32_t batch_size_per_scene,
                    uint8_t *color_ptr,
                    float *depth_ptr)
@@ -141,7 +141,7 @@ struct V4RRenderGroup {
         assert(views.size() == envs_.size());
 
         for (uint32_t env_idx = 0; env_idx < envs_.size(); env_idx++) {
-            envs_[envIdx].setCameraView(views[env_idx]);
+            envs_[env_idx].setCameraView(views[env_idx]);
         }
         
 
@@ -153,7 +153,7 @@ struct V4RRenderGroup {
     }
 
   private:
-    CommandStream &cmd_strm_;
+    CommandStreamCUDA &cmd_strm_;
     vector<Environment> envs_;
     const uint32_t batch_size_per_scene_;
 
@@ -164,14 +164,14 @@ struct V4RRenderGroup {
 
 class DoubleBuffered {
   public:
-    DoubleBuffered(BatchRenderer &&renderer, uint32_t numGroups,
+    DoubleBuffered(BatchRendererCUDA &&renderer, uint32_t numGroups,
                    const std::vector<std::string> &scene_paths,
                    uint32_t batch_size_per_scene, int gpu_id,
                    const std::vector<uint32_t> &resolution, bool color,
                    bool depth)
         : renderer_{std::move(renderer)}, loader_{renderer_.makeLoader()},
           cmd_strm_{renderer_.makeCommandStream()},
-          numScenes_{scene_paths.size()},
+          numScenes_{static_cast<uint32_t>(scene_paths.size())},
           batch_size_per_scene_{batch_size_per_scene},
           envsPerGroup_{numScenes_ * batch_size_per_scene_ / numGroups},
           renderGroups_{} {
@@ -189,8 +189,8 @@ class DoubleBuffered {
 
             renderGroups_.emplace_back(new V4RRenderGroup(
                 cmd_strm_, std::move(envs), batch_size_per_scene,
-                cmd_strm_.getColorDevPtr(i),
-                cmd_strm_.getDepthDevPtr(i)));
+                cmd_strm_.getColorDevicePtr(i),
+                cmd_strm_.getDepthDevicePtr(i)));
         }
     }
 
@@ -213,16 +213,16 @@ class DoubleBuffered {
 
     ~DoubleBuffered() = default;
 
-    at::Tensor getColorTensor(const uint32_t groupIdx) const {
-        return renderGroups_[groupIdx]->color_batch_;
+    void * getColorMemory(const uint32_t groupIdx) const {
+        return renderGroups_[groupIdx]->colorPtr;
     }
 
-    at::Tensor getDepthTensor(const uint32_t groupIdx) const {
-        return renderGroups_[groupIdx]->depth_batch_;
+    void * getDepthMemory(const uint32_t groupIdx) const {
+        return renderGroups_[groupIdx]->depthPtr;
     }
 
-    PyTorchSync render(const vector<glm::mat4> &views, const uint32_t groupIdx) {
-        return std::move(renderGroups_[groupIdx]->render(cameraPoses));
+    uint32_t render(const vector<glm::mat4> &views, const uint32_t groupIdx) {
+        return renderGroups_[groupIdx]->render(views);
     }
 
     bool isLoadingNextScene() {
@@ -234,7 +234,7 @@ class DoubleBuffered {
     }
 
     void loadNewScene(const std::string &scenePath) {
-        AT_ASSERT(!isLoadingNextScene(), "Already loading the next scene!");
+        assert(!isLoadingNextScene() && "Already loading the next scene!");
         newSceneFuture_ = loader_.asyncLoadScene(scenePath);
     }
 
@@ -248,15 +248,15 @@ class DoubleBuffered {
     void doneSwappingScene() { nextScene_ = nullptr; }
 
     void swapScene(const uint32_t envIdx, const uint32_t groupIdx) {
-        AT_ASSERT(hasNextScene(), "Next scene is nullptr");
+        assert(hasNextScene() && "Next scene is nullptr");
 
         renderGroups_[groupIdx]->swapScene(envIdx, nextScene_);
     }
 
   private:
-    BatchRenderer renderer_;
+    BatchRendererCUDA renderer_;
     BackgroundSceneLoader loader_;
-    CommandStream cmd_strm_;
+    CommandStreamCUDA cmd_strm_;
     const uint32_t numScenes_, batch_size_per_scene_, envsPerGroup_;
 
     vector<std::unique_ptr<V4RRenderGroup>> renderGroups_;
@@ -284,24 +284,21 @@ class SingleBuffered : public DoubleBuffered {
               depth} {};
 };
 
-//PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//    py::class_<PyTorchSync>(m, "PyTorchSync").def("wait", &PyTorchSync::wait);
-//
-//    py::class_<DoubleBuffered>(m, "DoubleBuffered")
-//        .def(py::init<const std::vector<string> &, int, int,
-//                      const std::vector<uint32_t> &, bool, bool>())
-//        .def("render", &DoubleBuffered::render)
-//        .def("rgba", &DoubleBuffered::getColorTensor)
-//        .def("depth", &DoubleBuffered::getDepthTensor)
-//        .def("done_swapping_scenes", &DoubleBuffered::doneSwappingScene)
-//        .def("acquire_next_scene", &DoubleBuffered::acquireNextScene)
-//        .def("load_new_scene", &DoubleBuffered::loadNewScene)
-//        .def("swap_scene", &DoubleBuffered::swapScene)
-//        .def("next_scene_loaded", &DoubleBuffered::nextSceneLoaded)
-//        .def("has_next_scene", &DoubleBuffered::hasNextScene)
-//        .def("is_loading_next_scene", &DoubleBuffered::isLoadingNextScene);
-//
-//    py::class_<SingleBuffered, DoubleBuffered>(m, "SingleBuffered")
-//        .def(py::init<const std::vector<string> &, int, int,
-//                      const std::vector<uint32_t> &, bool, bool>());
-//}
+PYBIND11_MODULE(ddppo_fastrollout, m) {
+    py::class_<DoubleBuffered>(m, "DoubleBuffered")
+        .def(py::init<const std::vector<string> &, int, int,
+                      const std::vector<uint32_t> &, bool, bool>())
+        .def("rgba", &DoubleBuffered::getColorMemory)
+        .def("depth", &DoubleBuffered::getDepthMemory)
+        .def("done_swapping_scenes", &DoubleBuffered::doneSwappingScene)
+        .def("acquire_next_scene", &DoubleBuffered::acquireNextScene)
+        .def("load_new_scene", &DoubleBuffered::loadNewScene)
+        .def("swap_scene", &DoubleBuffered::swapScene)
+        .def("next_scene_loaded", &DoubleBuffered::nextSceneLoaded)
+        .def("has_next_scene", &DoubleBuffered::hasNextScene)
+        .def("is_loading_next_scene", &DoubleBuffered::isLoadingNextScene);
+
+    py::class_<SingleBuffered, DoubleBuffered>(m, "SingleBuffered")
+        .def(py::init<const std::vector<string> &, int, int,
+                      const std::vector<uint32_t> &, bool, bool>());
+}
