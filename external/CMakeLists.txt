@@ -1,5 +1,6 @@
 add_subdirectory(v4r EXCLUDE_FROM_ALL)
 add_subdirectory(pybind11)
+add_subdirectory(simdjson EXCLUDE_FROM_ALL)
 
 add_library(habitat_sim_geodesic 
     habitat-sim-geodesic/habitat_sim_geodesic/csrc/recastnavigation-master/Detour/Source/DetourNode.cpp
