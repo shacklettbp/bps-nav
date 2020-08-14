@@ -6,6 +6,7 @@
 #include <zlib.h>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
 #include <array>
@@ -308,13 +309,13 @@ struct BackgroundSceneLoader {
         loader_thread_.join();
     }
 
-    shared_ptr<Scene> loadScene(const string &scene_path) {
+    shared_ptr<Scene> loadScene(const string_view &scene_path) {
         auto fut = asyncLoadScene(scene_path);
         fut.wait();
         return fut.get();
     }
 
-    future<shared_ptr<Scene>> asyncLoadScene(const string &scene_path) {
+    future<shared_ptr<Scene>> asyncLoadScene(const string_view &scene_path) {
         future<shared_ptr<Scene>> loader_future;
 
         {
@@ -330,7 +331,7 @@ struct BackgroundSceneLoader {
         return loader_future;
     }
 
-  private:
+private:
     void loaderLoop() {
         while (true) {
             string scene_path;
@@ -376,14 +377,6 @@ public:
 
     ~Renderer() = default;
 
-    uint8_t * getColorMemory(const uint32_t groupIdx) const {
-        return cmd_strm_.getColorDevicePtr(groupIdx);
-    }
-
-    float * getDepthMemory(const uint32_t groupIdx) const {
-        return cmd_strm_.getDepthDevicePtr(groupIdx);
-    }
-
     bool isLoadingNextScene() {
         return nextScene_ != nullptr || newSceneFuture_.valid();
     }
@@ -421,58 +414,60 @@ private:
     shared_ptr<Scene> nextScene_ = nullptr;
 };
 
-#if 0
-        for (uint32_t env_idx = 0; env_idx < envs_.size(); env_idx++) {
-            envs_[env_idx].setCameraView(views[env_idx]);
-        }
-             const vector<string> &initial_scene_paths,
-             uint32_t batch_size_per_scene, int gpu_id,
-
-                                 batch_size_per_scene *
-                                 static_cast<uint32_t>(
-                                     initial_scene_paths.size() / num_groups),
-
-        for (uint32_t i = 0, sceneIdx = 0; i < num_groups; ++i) {
-            vector<Environment> envs;
-            for (uint32_t __i = 0; __i < scene_paths.size() / num_groups;
-                 ++__i, ++sceneIdx) {
-
-                auto scene = loader_.loadScene(scene_paths[sceneIdx]);
-                for (uint32_t __j = 0; __j < batch_size_per_scene; ++__j)
-                    envs.emplace_back(
-                        move(cmd_strm_.makeEnvironment(scene, 90, 0.01, 1000)));
-            }
-
-            renderGroups_.emplace_back(new EnvironmentGroup(
-                cmd_strm_, move(envs), batch_size_per_scene,
-                cmd_strm_.getColorDevicePtr(i),
-                cmd_strm_.getDepthDevicePtr(i)));
+class Simulator {
+public:
+    Simulator(Span<const Episode> episodes, mt19937 &rgen)
+        : episodes_(episodes),
+          cur_episode_(0),
+          episode_order_(),
+          position_(),
+          step_(0)
+    {
+        episode_order_.reserve(episodes_.size());
+        for (size_t i = 0; i < episodes_.size(); i++) {
+            episode_order_.push_back(i);
         }
 
-        envsPerGroup_{numScenes_ * batch_size_per_scene_ / num_groups},
-#endif
+        shuffle(episode_order_.begin(), episode_order_.end(), rgen);
+    }
 
-class SimulatorState {
-    glm::vec3 curPosition;
+    void simulate(int64_t action, Environment &target_env)
+    {
+        const Episode &episode = episodes_[cur_episode_];
+
+    }
+
+private:
+    Span<const Episode> episodes_;
+    uint32_t cur_episode_;
+    vector<size_t> episode_order_;
+
+    glm::vec3 position_;
+    uint32_t step_;
 };
 
 struct EnvironmentGroup {
     EnvironmentGroup(CommandStreamCUDA &strm,
-                     AssetLoader &loader,
+                     BackgroundSceneLoader &loader,
                      const Dataset &dataset,
+                     mt19937 &rgen,
                      size_t envs_per_scene,
                      const Span<int> &initial_scene_indices)
         : cmd_strm_{strm},
           sim_states_(),
           render_envs_()
     {
-        sim_states_.reserve(envs_per_scene * initial_scene_indices.size());
         render_envs_.reserve(envs_per_scene * initial_scene_indices.size());
+        sim_states_.reserve(envs_per_scene * initial_scene_indices.size());
 
         for (int scene_idx : initial_scene_indices) {
             auto scene_path = dataset.getScenePath(scene_idx);
             auto scene = loader.loadScene(scene_path);
+
+            auto scene_episodes = dataset.getEpisodes(scene_idx);
+
             for (size_t env_idx = 0; env_idx < envs_per_scene; env_idx++) {
+                sim_states_.emplace_back(scene_episodes, rgen);
                 render_envs_.emplace_back(
                         strm.makeEnvironment(scene, 90, 0.1, 1000));
             }
@@ -482,6 +477,11 @@ struct EnvironmentGroup {
     void render()
     {
         cmd_strm_.render(render_envs_);
+    }
+
+    Simulator &getSimulator(size_t idx)
+    {
+        return sim_states_[idx];
     }
 
     Environment &getEnvironment(size_t idx)
@@ -495,7 +495,7 @@ struct EnvironmentGroup {
 
   private:
     CommandStreamCUDA &cmd_strm_;
-    vector<SimulatorState> sim_states_;
+    vector<Simulator> sim_states_;
     vector<Environment> render_envs_;
 };
 
@@ -516,11 +516,53 @@ public:
                            double_buffered ? 2u : 1u)
     {}
 
-    void step(size_t group_idx, const int64_t *action_ptr)
+    ~RolloutGenerator()
+    {
+        exit_ = true;
+        pthread_barrier_wait(&start_barrier_);
+
+        for (auto &t : worker_threads_) {
+            t.join();
+        }
+
+        pthread_barrier_destroy(&start_barrier_);
+        pthread_barrier_destroy(&finish_barrier_);
+    }
+
+    bool canSwapScene() const
+    {
+        return false;
+    }
+
+    void triggerSwapScene()
+    {
+    }
+
+    // action_ptr is a uint64_t to match torch.tensor.data_ptr()
+    void step(size_t group_idx, const uint64_t action_ptr)
     {
         EnvironmentGroup &cur_group = groups_[group_idx];
+        active_group_ = group_idx;
+        active_actions_ = (int64_t *)action_ptr;
+        pthread_barrier_wait(&start_barrier_);
+        pthread_barrier_wait(&finish_barrier_);
 
         cur_group.render();
+    }
+
+    py::capsule getColorMemory(const uint32_t groupIdx) const
+    {
+        return py::capsule(cmd_strm_.getColorDevicePtr(groupIdx));
+    }
+
+    py::capsule getDepthMemory(const uint32_t groupIdx) const
+    {
+        return py::capsule(cmd_strm_.getDepthDevicePtr(groupIdx));
+    }
+
+    py::capsule getCUDASemaphore(const uint32_t groupIdx) const
+    {
+        return py::capsule(cmd_strm_.getCudaSemaphore(groupIdx));
     }
 
 private:
@@ -539,7 +581,12 @@ private:
           rgen_(rd_()),
           inactive_scenes_(),
           groups_(),
-          worker_threads_()
+          worker_threads_(),
+          start_barrier_(),
+          finish_barrier_(),
+          active_group_(),
+          active_actions_(nullptr),
+          exit_(false)
     {
         groups_.reserve(num_groups);
         worker_threads_.reserve(num_workers);
@@ -564,30 +611,77 @@ private:
         assert(num_environments % num_active_scenes == 0);
         assert(num_active_scenes % num_groups == 0);
 
+        uint32_t envs_per_group = num_environments / num_groups;
         uint32_t scenes_per_group = num_active_scenes / num_groups;
         uint32_t envs_per_scene = num_environments / num_active_scenes;
 
         for (int i = 0; i < num_groups; i++) {
-            groups_.emplace_back(cmd_strm_, loader_, dataset_,
+            groups_.emplace_back(cmd_strm_, loader_, dataset_, rgen_,
                 envs_per_scene, Span(&initial_scene_idxs[i * scenes_per_group],
                                      scenes_per_group));
         }
 
+        pthread_barrier_init(&start_barrier_, nullptr, num_workers + 1);
+        pthread_barrier_init(&finish_barrier_, nullptr, num_workers + 1);
+
+        uint32_t envs_per_thread = envs_per_group / num_workers;
+        uint32_t extra_files = envs_per_group - envs_per_thread * num_workers;
+
+        size_t thread_env_offset = 0;
         for (int thread_idx = 0; thread_idx < num_workers; thread_idx++) {
-            worker_threads_.emplace_back([&, thread_idx]() {
+            size_t thread_num_envs = envs_per_thread;
+            if (extra_files > 0) {
+                thread_num_envs++;
+                extra_files--;
+            }
+
+            worker_threads_.emplace_back(
+                    [this, thread_env_offset, thread_num_envs]() {
+                simulationWorker(thread_env_offset, thread_num_envs);
             });
+
+            thread_env_offset += thread_num_envs;
+        }
+    }
+
+    void simulationWorker(size_t first_env_idx, size_t num_envs)
+    {
+        size_t end_env_idx = first_env_idx + num_envs;
+
+        while (true) {
+            pthread_barrier_wait(&start_barrier_);
+            if (exit_) {
+                return;
+            }
+
+            EnvironmentGroup &group = groups_[active_group_];
+            for (size_t env_idx = first_env_idx; env_idx < end_env_idx;
+                 env_idx++) {
+                Simulator &sim = group.getSimulator(env_idx);
+                Environment &render_env = group.getEnvironment(env_idx);
+                sim.simulate(active_actions_[env_idx], render_env);
+            }
+
+            pthread_barrier_wait(&finish_barrier_);
         }
     }
 
     Dataset dataset_;
     BatchRendererCUDA renderer_;
     CommandStreamCUDA cmd_strm_;
-    AssetLoader loader_;
+    BackgroundSceneLoader loader_;
+
     random_device rd_;
     mt19937 rgen_;
     vector<int> inactive_scenes_;
     vector<EnvironmentGroup> groups_;
+
     vector<thread> worker_threads_;
+    pthread_barrier_t start_barrier_;
+    pthread_barrier_t finish_barrier_;
+    size_t active_group_;
+    int64_t *active_actions_;
+    bool exit_;
 };
 
 PYBIND11_MODULE(ddppo_fastrollout, m) {
@@ -596,9 +690,9 @@ PYBIND11_MODULE(ddppo_fastrollout, m) {
                       uint32_t, uint32_t, int, int,
                       const array<uint32_t, 2> &,
                       bool, bool, bool>())
-        .def("step", &RolloutGenerator::step);
-        //.def("rgba", &RolloutGenerator::getColorMemory)
-        //.def("depth", &RolloutGenerator::getDepthMemory)
+        .def("step", &RolloutGenerator::step)
+        .def("rgba", &RolloutGenerator::getColorMemory)
+        .def("depth", &RolloutGenerator::getDepthMemory);
         //.def("done_swapping_scenes", &DoubleBuffered::doneSwappingScene)
         //.def("acquire_next_scene", &DoubleBuffered::acquireNextScene)
         //.def("load_new_scene", &DoubleBuffered::loadNewScene)

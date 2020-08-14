@@ -10,9 +10,12 @@ namespace py = pybind11;
 
 // Create a tensor that references this memory
 //
-at::Tensor convertToTensorColor(void *dev_ptr, int dev_id, uint32_t batch_size,
+at::Tensor convertToTensorColor(const py::capsule &ptr_capsule,
+                                int dev_id, uint32_t batch_size,
                                 const array<uint32_t, 2> &resolution)
 {
+    uint8_t *dev_ptr(ptr_capsule);
+
     array<int64_t, 4> sizes{{batch_size, resolution[0], resolution[1], 4}};
 
     auto options = torch::TensorOptions()
@@ -24,9 +27,12 @@ at::Tensor convertToTensorColor(void *dev_ptr, int dev_id, uint32_t batch_size,
 
 // Create a tensor that references this memory
 //
-at::Tensor convertToTensorDepth(void *dev_ptr, int dev_id, uint32_t batch_size,
+at::Tensor convertToTensorDepth(const py::capsule &ptr_capsule,
+                                int dev_id, uint32_t batch_size,
                                 const array<uint32_t, 2> &resolution)
 {
+    float *dev_ptr(ptr_capsule);
+
     array<int64_t, 3> sizes{{batch_size, resolution[0], resolution[1]}};
 
     auto options = torch::TensorOptions()
@@ -38,8 +44,8 @@ at::Tensor convertToTensorDepth(void *dev_ptr, int dev_id, uint32_t batch_size,
 
 class PyTorchSync {
 public:
-    PyTorchSync(cudaExternalSemaphore_t sema)
-        : sema_(sema)
+    PyTorchSync(const py::capsule &cap)
+        : sema_(cudaExternalSemaphore_t(cap))
     {}
 
     void wait() 
@@ -61,7 +67,9 @@ private:
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    py::class_<PyTorchSync>(m, "PyTorchSync").def("wait", &PyTorchSync::wait);
+    py::class_<PyTorchSync>(m, "PyTorchSync")
+        .def(py::init<const py::capsule &>())
+        .def("wait", &PyTorchSync::wait);
     m.def("make_color_tensor", &convertToTensorColor);
     m.def("make_depth_tensor", &convertToTensorDepth);
 }
