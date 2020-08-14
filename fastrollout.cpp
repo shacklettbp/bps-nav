@@ -1,24 +1,26 @@
 #include <v4r/cuda.hpp>
 #include <PathFinder.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <simdjson.h>
 #include <zlib.h>
 
 #include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/quaternion.hpp>
 
 #include <algorithm>
 #include <array>
 #include <condition_variable>
-#include <fstream>
 #include <filesystem>
-#include <thread>
+#include <fstream>
 #include <future>
+#include <memory>
 #include <queue>
 #include <random>
-#include <utility>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace std;
@@ -30,53 +32,18 @@ namespace SimulatorConfig {
     constexpr float SLACK_REWARD = 1e-2;
     constexpr float SUCCESS_DISTANCE = 0.2;
     constexpr float MAX_STEPS = 500;
-}
+    constexpr float FORWARD_STEP_SIZE = 0.25;
+    constexpr float TURN_ANGLE = glm::radians(10.f);
+    constexpr glm::vec3 UP_VECTOR(0.f, 1.f, 0.f);
 
-struct Episode {
-    glm::vec3 startPosition;
-    glm::vec4 startRotation;
-    glm::vec3 goal;
-};
+    constexpr glm::vec3 CAM_FWD_VECTOR =
+        glm::vec3(0.f, 0.f, -1.f) * FORWARD_STEP_SIZE;
 
-struct SceneMetadata {
-    size_t firstEpisode;
-    size_t numEpisodes;
-    string scenePath;
-};
+    static const glm::quat LEFT_ROTATION =
+        glm::angleAxis(-TURN_ANGLE, UP_VECTOR);
 
-static simdjson::dom::element parseFile(const string &file_path,
-                                        size_t num_bytes,
-                                        simdjson::dom::parser &parser)
-{
-    gzFile gz = gzopen(file_path.c_str(), "rb");
-    if (gz == nullptr) {
-        cerr << "Failed to open " << file_path << endl;
-        abort();
-    }
-
-    vector<uint8_t> out_data {};
-
-    size_t cur_out_size = num_bytes * 2;
-    int cur_decompressed = 0;
-    size_t total_decompressed = 0;
-    for (int cur_decompressed = 0;
-         !gzeof(gz) && cur_decompressed >= 0;
-         cur_decompressed = gzread(gz, out_data.data() + total_decompressed,
-                                   cur_out_size - total_decompressed),
-         total_decompressed += cur_decompressed,
-         cur_out_size *= 2) {
-
-        out_data.resize(cur_out_size + simdjson::SIMDJSON_PADDING);
-    }
-
-    if (cur_decompressed == -1) {
-        cerr << "Failed to read " << file_path << endl;
-        abort();
-    }
-
-    gzclose(gz);
-
-    return parser.parse(out_data.data(), total_decompressed, false);
+    static const glm::quat RIGHT_ROTATION =
+        glm::angleAxis(TURN_ANGLE, UP_VECTOR);
 }
 
 template <typename T>
@@ -101,6 +68,53 @@ private:
     T *ptr_;
     size_t num_elems_;
 };
+
+struct Episode {
+    glm::vec3 startPosition;
+    glm::quat startRotation;
+    glm::vec3 goal;
+};
+
+struct SceneMetadata {
+    size_t firstEpisode;
+    size_t numEpisodes;
+    string meshPath;
+    string navPath;
+};
+
+static simdjson::dom::element parseFile(const string &file_path,
+                                        size_t num_bytes,
+                                        simdjson::dom::parser &parser)
+{
+    gzFile gz = gzopen(file_path.c_str(), "rb");
+    if (gz == nullptr) {
+        cerr << "Failed to open " << file_path << endl;
+        abort();
+    }
+
+    vector<uint8_t> out_data {};
+
+    size_t cur_out_size = num_bytes * 2;
+    int cur_decompressed = 0;
+    size_t total_decompressed = 0;
+    for (; !gzeof(gz) && cur_decompressed >= 0;
+         cur_decompressed = gzread(gz, out_data.data() + total_decompressed,
+                                   cur_out_size - total_decompressed),
+         total_decompressed += cur_decompressed,
+         cur_out_size *= 2) {
+
+        out_data.resize(cur_out_size + simdjson::SIMDJSON_PADDING);
+    }
+
+    if (cur_decompressed == -1) {
+        cerr << "Failed to read " << file_path << endl;
+        abort();
+    }
+
+    gzclose(gz);
+
+    return parser.parse(out_data.data(), total_decompressed, false);
+}
 
 class Dataset {
 public:
@@ -177,7 +191,7 @@ public:
 
                         glm::vec3 start_pos;
                         fill_vec(start_pos, json_episode["start_position"]);
-                        glm::vec4 start_rot;
+                        glm::quat start_rot;
                         fill_vec(start_rot, json_episode["start_rotation"]);
                         
                         glm::vec3 goal_pos;
@@ -202,10 +216,20 @@ public:
                     }
 
                     if (scene_id.size() > 0) {
+                        size_t dotpos = scene_id.rfind('.');
+                        if (dotpos == string_view::npos) {
+                            cerr << "Invalid scene id: " << scene_id << endl;
+                            abort();
+                        }
+
+                        // FIXME is there some more principled way to get this?
+                        string navmesh_suffix = string(scene_id.substr(0, dotpos)) + ".navmesh";
+
                         scenes.push_back({
                             scene_episode_start,
                             episodes.size() - scene_episode_start,
-                            asset_path_name + "/" + string(scene_id)
+                            asset_path_name + "/" + string(scene_id),
+                            asset_path_name + "/" + navmesh_suffix
                         });
                     }
                 }
@@ -241,7 +265,12 @@ public:
 
     const string_view getScenePath(size_t scene_idx) const
     {
-        return scenes_[scene_idx].scenePath;
+        return scenes_[scene_idx].meshPath;
+    }
+
+    const string_view getNavmeshPath(size_t scene_idx) const
+    {
+        return scenes_[scene_idx].navPath;
     }
 
     size_t numScenes() const
@@ -309,13 +338,13 @@ struct BackgroundSceneLoader {
         loader_thread_.join();
     }
 
-    shared_ptr<Scene> loadScene(const string_view &scene_path) {
+    shared_ptr<Scene> loadScene(string_view scene_path) {
         auto fut = asyncLoadScene(scene_path);
         fut.wait();
         return fut.get();
     }
 
-    future<shared_ptr<Scene>> asyncLoadScene(const string_view &scene_path) {
+    future<shared_ptr<Scene>> asyncLoadScene(string_view scene_path) {
         future<shared_ptr<Scene>> loader_future;
 
         {
@@ -414,14 +443,39 @@ private:
     shared_ptr<Scene> nextScene_ = nullptr;
 };
 
+struct StepInfo {
+    float success;
+    float spl;
+    float distanceToGoal;
+};
+
+struct ResultPointers {
+    float *reward;
+    float *mask;
+    StepInfo *info;
+    glm::vec2 *polar;
+};
+
 class Simulator {
 public:
-    Simulator(Span<const Episode> episodes, mt19937 &rgen)
+    Simulator(Span<const Episode> episodes,
+              string_view navmesh_path,
+              Environment &render_env,
+              ResultPointers ptrs,
+              mt19937 &rgen)
         : episodes_(episodes),
           cur_episode_(0),
           episode_order_(),
+          render_env_(&render_env),
+          outputs_(ptrs),
+          pathfinder_(make_unique<esp::nav::PathFinder>()),
           position_(),
-          step_(0)
+          rotation_(),
+          goal_(),
+          initial_distance_to_goal_(),
+          prev_distance_to_goal_(),
+          cumulative_travel_distance_(),
+          step_()
     {
         episode_order_.reserve(episodes_.size());
         for (size_t i = 0; i < episodes_.size(); i++) {
@@ -429,24 +483,176 @@ public:
         }
 
         shuffle(episode_order_.begin(), episode_order_.end(), rgen);
+
+        bool navmesh_success = pathfinder_->loadNavMesh(string(navmesh_path));
+        if (!navmesh_success) {
+            cerr << "Failed to load navmesh: " << navmesh_path << endl;
+            abort();
+        }
     }
 
-    void simulate(int64_t action, Environment &target_env)
+    void reset()
     {
-        const Episode &episode = episodes_[cur_episode_];
+        step_ = 1;
 
+        const Episode &episode = episodes_[episode_order_[cur_episode_]];
+        position_ = episode.startPosition;
+        rotation_ = episode.startRotation;
+        goal_ = episode.goal;
+
+        cumulative_travel_distance_ = 0;
+        initial_distance_to_goal_ = geoDist(position_, goal_);
+        prev_distance_to_goal_ = initial_distance_to_goal_;
+
+        updateObservationState();
+
+        cur_episode_++;
+    }
+
+    void step(int64_t raw_action)
+    {
+        SimAction action { raw_action };
+        step_++;
+        bool done = step_ >= SimulatorConfig::MAX_STEPS;
+        float reward = -SimulatorConfig::SLACK_REWARD;
+
+        float success = 0;
+        float distance_to_goal = 0;
+
+        if (action == SimAction::Stop) {
+            done = true;
+            distance_to_goal = geoDist(goal_, position_);
+            success = float(distance_to_goal <= SimulatorConfig::SUCCESS_DISTANCE);
+            reward += success * SimulatorConfig::SUCCESS_REWARD;
+        } else {
+            glm::vec3 prev_position = position_;
+
+            handleMovement(action);
+            updateObservationState();
+
+            distance_to_goal = geoDist(goal_, position_);
+            reward += prev_distance_to_goal_ - distance_to_goal;
+            cumulative_travel_distance_ +=
+                glm::length(position_ - prev_position);
+
+            prev_distance_to_goal_ = distance_to_goal;
+        }
+
+        StepInfo info {
+            success,
+            success * initial_distance_to_goal_ /
+                max(initial_distance_to_goal_, cumulative_travel_distance_),
+            distance_to_goal
+        };
+
+        *outputs_.reward = reward;
+        if (done) {
+            *outputs_.mask = 0.f;
+        } else {
+            *outputs_.mask = 1.f;
+        }
+        *outputs_.info = info;
+
+        if (done) {
+            reset();
+        }
     }
 
 private:
+    enum class SimAction : int64_t {
+        Stop = 0,
+        MoveForward = 1,
+        TurnLeft = 2,
+        TurnRight = 3
+    };
+
+    inline float geoDist(const glm::vec3 &start, const glm::vec3 &end)
+    {
+        esp::nav::ShortestPath test_path;
+        test_path.requestedStart[0] = start.x;
+        test_path.requestedStart[1] = start.y;
+        test_path.requestedStart[2] = start.z;
+        test_path.requestedEnd[0] = end.x;
+        test_path.requestedEnd[1] = end.y;
+        test_path.requestedEnd[2] = end.z;
+
+        pathfinder_->findPath(test_path);
+        return test_path.geodesicDistance;
+    }
+
+    inline void updateObservationState()
+    {
+        // Update renderer view matrix (World -> Camera)
+        glm::mat3 rot = glm::mat3_cast(rotation_);
+        glm::mat4 new_view(glm::transpose(rot));
+
+        glm::vec3 eye_pos = position_ + SimulatorConfig::UP_VECTOR * 1.25f;
+
+        glm::vec4 translate(rot * eye_pos, 1.f);
+        new_view[3] = -translate;
+
+        render_env_->setCameraView(new_view);
+
+        // Write out polar coordinates
+        glm::vec3 to_goal = goal_ - position_;
+        glm::vec3 to_goal_view = rot * to_goal;
+
+        auto cartesianToPolar = [](float x, float y) {
+            float rho = glm::length(glm::vec2(x, y));
+            float phi = atan2f(y, x);
+
+            return glm::vec2(rho, phi);
+        };
+
+        *outputs_.polar = cartesianToPolar(-to_goal_view.z, to_goal_view.x);
+    }
+
+    inline void handleMovement(SimAction action)
+    {
+        switch (action) {
+        case SimAction::MoveForward:
+            position_ += glm::rotate(rotation_,
+                                     SimulatorConfig::CAM_FWD_VECTOR);
+            break;
+        case SimAction::TurnLeft:
+            rotation_ = SimulatorConfig::LEFT_ROTATION * rotation_;
+            break;
+        case SimAction::TurnRight:
+            rotation_ = SimulatorConfig::RIGHT_ROTATION * rotation_;
+            break;
+        default:
+            cerr << "Unknown action: " << static_cast<int64_t>(action) << endl;
+            abort();
+        }
+    }
+
     Span<const Episode> episodes_;
     uint32_t cur_episode_;
     vector<size_t> episode_order_;
+    Environment *render_env_;
+    ResultPointers outputs_;
+    unique_ptr<esp::nav::PathFinder> pathfinder_;
 
     glm::vec3 position_;
+    glm::quat rotation_;
+    glm::vec3 goal_;
+    float initial_distance_to_goal_;
+    float prev_distance_to_goal_;
+    float cumulative_travel_distance_;
     uint32_t step_;
 };
 
-struct EnvironmentGroup {
+template <typename T>
+static py::array_t<T> makeFlatNumpyArray(vector<T> &vec)
+{
+    return py::array_t<T>(
+            py::buffer_info(vec.data(), sizeof(T),
+                            py::format_descriptor<T>::format(),
+                            1, { vec.size() }, { sizeof(T) }));
+}
+
+class EnvironmentGroup {
+public:
     EnvironmentGroup(CommandStreamCUDA &strm,
                      BackgroundSceneLoader &loader,
                      const Dataset &dataset,
@@ -454,22 +660,39 @@ struct EnvironmentGroup {
                      size_t envs_per_scene,
                      const Span<int> &initial_scene_indices)
         : cmd_strm_{strm},
+          render_envs_(),
           sim_states_(),
-          render_envs_()
+          rewards_(envs_per_scene * initial_scene_indices.size()),
+          masks_(rewards_.size()),
+          infos_(rewards_.size()),
+          polars_(rewards_.size())
     {
-        render_envs_.reserve(envs_per_scene * initial_scene_indices.size());
-        sim_states_.reserve(envs_per_scene * initial_scene_indices.size());
+        render_envs_.reserve(rewards_.size());
+        sim_states_.reserve(rewards_.size());
+
+        auto get_pointers = [this](size_t idx) {
+            return ResultPointers {
+                &rewards_[idx],
+                &masks_[idx],
+                &infos_[idx],
+                &polars_[idx]
+            };
+        };
 
         for (int scene_idx : initial_scene_indices) {
             auto scene_path = dataset.getScenePath(scene_idx);
             auto scene = loader.loadScene(scene_path);
 
             auto scene_episodes = dataset.getEpisodes(scene_idx);
+            auto scene_navmesh = dataset.getNavmeshPath(scene_idx);
 
             for (size_t env_idx = 0; env_idx < envs_per_scene; env_idx++) {
-                sim_states_.emplace_back(scene_episodes, rgen);
                 render_envs_.emplace_back(
                         strm.makeEnvironment(scene, 90, 0.1, 1000));
+                sim_states_.emplace_back(scene_episodes, scene_navmesh,
+                                         render_envs_.back(),
+                                         get_pointers(sim_states_.size()),
+                                         rgen);
             }
         }
     }
@@ -489,14 +712,44 @@ struct EnvironmentGroup {
         return render_envs_[idx];
     }
 
+    py::array_t<float> getRewards()
+    {
+        return makeFlatNumpyArray(rewards_);
+    }
+
+    py::array_t<float> getMasks()
+    {
+        return makeFlatNumpyArray(masks_);
+    }
+
+    py::array_t<float> getInfos()
+    {
+        return makeFlatNumpyArray(infos_);
+    }
+
+    py::array_t<float> getPolars()
+    {
+        return py::array_t<float>(
+            py::buffer_info(reinterpret_cast<float *>(polars_.data()),
+                            sizeof(float),
+                            py::format_descriptor<float>::format(),
+                            2, { polars_.size(), 2ul },
+                            { sizeof(float) * 2, sizeof(float) }));
+    }
+
     void swapScene(const uint32_t envIdx, const shared_ptr<Scene> &nextScene) {
-        render_envs_[envIdx] = cmd_strm_.makeEnvironment(nextScene, 90, 0.01, 1000);
+        render_envs_[envIdx] =
+            cmd_strm_.makeEnvironment(nextScene, 90, 0.01, 1000);
     }
 
   private:
     CommandStreamCUDA &cmd_strm_;
-    vector<Simulator> sim_states_;
     vector<Environment> render_envs_;
+    vector<Simulator> sim_states_;
+    vector<float> rewards_;
+    vector<float> masks_;
+    vector<StepInfo> infos_;
+    vector<glm::vec2> polars_;
 };
 
 class RolloutGenerator {
@@ -538,16 +791,35 @@ public:
     {
     }
 
-    // action_ptr is a uint64_t to match torch.tensor.data_ptr()
-    void step(size_t group_idx, const uint64_t action_ptr)
+    void reset(uint32_t group_idx)
     {
-        EnvironmentGroup &cur_group = groups_[group_idx];
-        active_group_ = group_idx;
-        active_actions_ = (int64_t *)action_ptr;
-        pthread_barrier_wait(&start_barrier_);
-        pthread_barrier_wait(&finish_barrier_);
+        simulateAndRender(group_idx, true, nullptr);
+    }
 
-        cur_group.render();
+    // action_ptr is a uint64_t to match torch.tensor.data_ptr()
+    void step(uint32_t group_idx, const uint64_t action_ptr)
+    {
+        simulateAndRender(group_idx, false, (const int64_t *)action_ptr);
+    }
+
+    py::array_t<float> getRewards(uint32_t group_idx)
+    {
+        return groups_[group_idx].getRewards();
+    }
+
+    py::array_t<float> getMasks(uint32_t group_idx)
+    {
+        return groups_[group_idx].getMasks();
+    }
+
+    py::array_t<StepInfo> getInfos(uint32_t group_idx)
+    {
+        return groups_[group_idx].getInfos();
+    }
+
+    py::array_t<float> getPolars(uint32_t group_idx)
+    {
+        return groups_[group_idx].getPolars();
     }
 
     py::capsule getColorMemory(const uint32_t groupIdx) const
@@ -586,6 +858,7 @@ private:
           finish_barrier_(),
           active_group_(),
           active_actions_(nullptr),
+          sim_reset_(false),
           exit_(false)
     {
         groups_.reserve(num_groups);
@@ -596,7 +869,7 @@ private:
         inactive_scenes_.reserve(dataset_.numScenes() - num_active_scenes);
 
         uniform_real_distribution<> selection_distribution(0.f, 1.f);
-        for (int i = 0 ; i < dataset_.numScenes() &&
+        for (uint32_t i = 0 ; i < dataset_.numScenes() &&
              initial_scene_idxs.size() < num_active_scenes; i++) {
             float weight = selection_distribution(rgen_);
             if ((dataset_.numScenes() - i) * weight >=
@@ -615,7 +888,7 @@ private:
         uint32_t scenes_per_group = num_active_scenes / num_groups;
         uint32_t envs_per_scene = num_environments / num_active_scenes;
 
-        for (int i = 0; i < num_groups; i++) {
+        for (uint32_t i = 0; i < num_groups; i++) {
             groups_.emplace_back(cmd_strm_, loader_, dataset_, rgen_,
                 envs_per_scene, Span(&initial_scene_idxs[i * scenes_per_group],
                                      scenes_per_group));
@@ -644,6 +917,18 @@ private:
         }
     }
 
+    void simulateAndRender(uint32_t active_group, bool trigger_reset,
+                           const int64_t *action_ptr)
+    {
+        active_group_ = active_group;
+        active_actions_ = action_ptr;
+        sim_reset_ = trigger_reset;
+        pthread_barrier_wait(&start_barrier_);
+        pthread_barrier_wait(&finish_barrier_);
+
+        groups_[active_group].render();
+    }
+
     void simulationWorker(size_t first_env_idx, size_t num_envs)
     {
         size_t end_env_idx = first_env_idx + num_envs;
@@ -654,12 +939,17 @@ private:
                 return;
             }
 
+            const bool trigger_reset = sim_reset_;
+
             EnvironmentGroup &group = groups_[active_group_];
             for (size_t env_idx = first_env_idx; env_idx < end_env_idx;
                  env_idx++) {
                 Simulator &sim = group.getSimulator(env_idx);
-                Environment &render_env = group.getEnvironment(env_idx);
-                sim.simulate(active_actions_[env_idx], render_env);
+                if (trigger_reset) {
+                    sim.reset();
+                } else {
+                    sim.step(active_actions_[env_idx]);
+                }
             }
 
             pthread_barrier_wait(&finish_barrier_);
@@ -679,20 +969,27 @@ private:
     vector<thread> worker_threads_;
     pthread_barrier_t start_barrier_;
     pthread_barrier_t finish_barrier_;
-    size_t active_group_;
-    int64_t *active_actions_;
+    uint32_t active_group_;
+    const int64_t *active_actions_;
+    bool sim_reset_;
     bool exit_;
 };
 
 PYBIND11_MODULE(ddppo_fastrollout, m) {
+    PYBIND11_NUMPY_DTYPE(StepInfo, success, spl, distanceToGoal);
     py::class_<RolloutGenerator>(m, "RolloutGenerator")
         .def(py::init<const string &, const string &,
                       uint32_t, uint32_t, int, int,
                       const array<uint32_t, 2> &,
                       bool, bool, bool>())
         .def("step", &RolloutGenerator::step)
+        .def("reset", &RolloutGenerator::reset)
         .def("rgba", &RolloutGenerator::getColorMemory)
-        .def("depth", &RolloutGenerator::getDepthMemory);
+        .def("depth", &RolloutGenerator::getDepthMemory)
+        .def("getRewards", &RolloutGenerator::getRewards)
+        .def("getMasks", &RolloutGenerator::getMasks)
+        .def("getInfos", &RolloutGenerator::getInfos)
+        .def("getPolars", &RolloutGenerator::getPolars);
         //.def("done_swapping_scenes", &DoubleBuffered::doneSwappingScene)
         //.def("acquire_next_scene", &DoubleBuffered::acquireNextScene)
         //.def("load_new_scene", &DoubleBuffered::loadNewScene)
