@@ -8,6 +8,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtx/quaternion.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 #include <algorithm>
 #include <array>
@@ -524,12 +525,9 @@ private:
     inline float geoDist(const glm::vec3 &start, const glm::vec3 &end)
     {
         esp::nav::ShortestPath test_path;
-        test_path.requestedStart[0] = start.x;
-        test_path.requestedStart[1] = start.y;
-        test_path.requestedStart[2] = start.z;
-        test_path.requestedEnd[0] = end.x;
-        test_path.requestedEnd[1] = end.y;
-        test_path.requestedEnd[2] = end.z;
+
+        test_path.requestedStart = Eigen::Map<esp::vec3f>{glm::value_ptr(start)};
+        test_path.requestedEnd = Eigen::Map<esp::vec3f>{glm::value_ptr(end)};
 
         pathfinder_->findPath(test_path);
         return test_path.geodesicDistance;
@@ -566,8 +564,13 @@ private:
     {
         switch (action) {
         case SimAction::MoveForward:
-            position_ += glm::rotate(rotation_,
-                                     SimulatorConfig::CAM_FWD_VECTOR);
+            glm::vec3 delta = glm::rotate(rotation_, SimulatorConfig::CAM_FWD_VECTOR);
+
+            const esp::vec3f oldPos = Eigen::Map<esp::vec3f>{glm::value_ptr(position_)};
+            const esp::vec3f newPos = oldPos + Eigen::Map<esp::vec3f>{glm::value_ptr(delta)};
+            const esp::vec3f filteredPos = pathfinder_->tryStep(oldPos, newPos);
+
+            position_ = glm::make_vec3(filteredPos.data());
             break;
         case SimAction::TurnLeft:
             rotation_ = SimulatorConfig::LEFT_ROTATION * rotation_;
@@ -1004,7 +1007,7 @@ private:
             EnvironmentGroup &group = groups_[active_group_];
             for (uint32_t env_idx = first_env_idx; env_idx < end_env_idx;
                  env_idx++) {
-                Simulator &sim = group.getSimulator(env_idx);
+                std::ref<Simulator> sim = group.getSimulator(env_idx);
 
                 if (trigger_reset) {
                     sim.reset();
@@ -1015,6 +1018,8 @@ private:
                             group.swapReady(env_idx)) {
                         group.swapScene(env_idx, next_scene_);
                         num_scene_loads_.fetch_sub(1, memory_order_relaxed);
+                        sim = group.getSimulator(env_idx);
+                        sim.reset();
                     }
                 }
             }
