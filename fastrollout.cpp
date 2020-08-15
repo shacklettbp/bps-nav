@@ -372,10 +372,11 @@ private:
             {
                 unique_lock<mutex> wait_lock(loader_mutex_);
                 while (loader_requests_.size() == 0) {
-                    loader_cv_.wait(wait_lock);
                     if (loader_exit_) {
                         return;
                     }
+
+                    loader_cv_.wait(wait_lock);
                 }
 
                 scene_path = move(loader_requests_.front().first);
