@@ -932,8 +932,8 @@ private:
         for (scene_idx = 0 ; scene_idx < dataset_.numScenes() &&
              active_scenes_.size() < num_active_scenes; scene_idx++) {
             float weight = selection_distribution(rgen_);
-            if ((dataset_.numScenes() - scene_idx) * weight >=
-                (num_active_scenes - active_scenes_.size())) {
+            if (weight * float(dataset_.numScenes() - scene_idx) <
+                float(num_active_scenes - active_scenes_.size())) {
                 active_scenes_.push_back(scene_idx);
             } else {
                 inactive_scenes_.push_back(scene_idx);
