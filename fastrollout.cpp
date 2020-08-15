@@ -507,10 +507,6 @@ public:
         }
         *outputs_.info = info;
 
-        if (done) {
-            reset();
-        }
-
         return done;
     }
 
@@ -526,8 +522,8 @@ private:
     {
         esp::nav::ShortestPath test_path;
 
-        test_path.requestedStart = Eigen::Map<esp::vec3f>{glm::value_ptr(start)};
-        test_path.requestedEnd = Eigen::Map<esp::vec3f>{glm::value_ptr(end)};
+        test_path.requestedStart = Eigen::Map<const esp::vec3f>{glm::value_ptr(start)};
+        test_path.requestedEnd = Eigen::Map<const esp::vec3f>{glm::value_ptr(end)};
 
         pathfinder_->findPath(test_path);
         return test_path.geodesicDistance;
@@ -563,24 +559,27 @@ private:
     inline void handleMovement(SimAction action)
     {
         switch (action) {
-        case SimAction::MoveForward:
-            glm::vec3 delta = glm::rotate(rotation_, SimulatorConfig::CAM_FWD_VECTOR);
+            case SimAction::MoveForward: {
+                glm::vec3 delta = glm::rotate(rotation_,
+                                              SimulatorConfig::CAM_FWD_VECTOR);
+                glm::vec3 new_pos = position_ + delta;
 
-            const esp::vec3f oldPos = Eigen::Map<esp::vec3f>{glm::value_ptr(position_)};
-            const esp::vec3f newPos = oldPos + Eigen::Map<esp::vec3f>{glm::value_ptr(delta)};
-            const esp::vec3f filteredPos = pathfinder_->tryStep(oldPos, newPos);
+                const esp::vec3f filtered_pos = pathfinder_->tryStep(
+                    Eigen::Map<const esp::vec3f>(glm::value_ptr(position_)),
+                    Eigen::Map<const esp::vec3f>(glm::value_ptr(new_pos)));
 
-            position_ = glm::make_vec3(filteredPos.data());
-            break;
-        case SimAction::TurnLeft:
-            rotation_ = SimulatorConfig::LEFT_ROTATION * rotation_;
-            break;
-        case SimAction::TurnRight:
-            rotation_ = SimulatorConfig::RIGHT_ROTATION * rotation_;
-            break;
-        default:
-            cerr << "Unknown action: " << static_cast<int64_t>(action) << endl;
-            abort();
+                position_ = glm::make_vec3(filtered_pos.data());
+                break;
+            } case SimAction::TurnLeft: {
+                rotation_ = SimulatorConfig::LEFT_ROTATION * rotation_;
+                break;
+            } case SimAction::TurnRight: {
+                rotation_ = SimulatorConfig::RIGHT_ROTATION * rotation_;
+                break;
+            } default: {
+                cerr << "Unknown action: " << static_cast<int64_t>(action) << endl;
+                abort();
+            }
         }
     }
 
@@ -1007,7 +1006,7 @@ private:
             EnvironmentGroup &group = groups_[active_group_];
             for (uint32_t env_idx = first_env_idx; env_idx < end_env_idx;
                  env_idx++) {
-                std::ref<Simulator> sim = group.getSimulator(env_idx);
+                Simulator &sim = group.getSimulator(env_idx);
 
                 if (trigger_reset) {
                     sim.reset();
@@ -1018,7 +1017,9 @@ private:
                             group.swapReady(env_idx)) {
                         group.swapScene(env_idx, next_scene_);
                         num_scene_loads_.fetch_sub(1, memory_order_relaxed);
-                        sim = group.getSimulator(env_idx);
+                    }
+
+                    if (done) {
                         sim.reset();
                     }
                 }
