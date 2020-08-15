@@ -643,12 +643,14 @@ private:
 };
 
 template <typename T>
-static py::array_t<T> makeFlatNumpyArray(vector<T> &vec)
+static py::array_t<T> makeFlatNumpyArray(const vector<T> &vec)
 {
-    return py::array_t<T>(
-            py::buffer_info(vec.data(), sizeof(T),
-                            py::format_descriptor<T>::format(),
-                            1, { vec.size() }, { sizeof(T) }));
+    // Final py::none argument stops the data from being copied
+    // Technically unsafe, because the python array can persist
+    // after the array is deallocated by C++, but the expectation
+    // is the RolloutGenerator will live for the whole computation.
+    return py::array_t<T>({ vec.size() }, { sizeof(T) },
+                          vec.data(), py::none());
 }
 
 class EnvironmentGroup {
@@ -712,29 +714,27 @@ public:
         return render_envs_[idx];
     }
 
-    py::array_t<float> getRewards()
+    py::array_t<float> getRewards() const
     {
         return makeFlatNumpyArray(rewards_);
     }
 
-    py::array_t<float> getMasks()
+    py::array_t<float> getMasks() const
     {
         return makeFlatNumpyArray(masks_);
     }
 
-    py::array_t<float> getInfos()
+    py::array_t<StepInfo> getInfos() const
     {
         return makeFlatNumpyArray(infos_);
     }
 
-    py::array_t<float> getPolars()
+    py::array_t<float> getPolars() const
     {
         return py::array_t<float>(
-            py::buffer_info(reinterpret_cast<float *>(polars_.data()),
-                            sizeof(float),
-                            py::format_descriptor<float>::format(),
-                            2, { polars_.size(), 2ul },
-                            { sizeof(float) * 2, sizeof(float) }));
+            { polars_.size(), 2ul },
+            { sizeof(float) * 2, sizeof(float) },
+            &polars_[0].x, py::none());
     }
 
     void swapScene(const uint32_t envIdx, const shared_ptr<Scene> &nextScene) {
@@ -762,7 +762,7 @@ public:
         : RolloutGenerator(dataset_path, asset_path,
                            num_environments, num_active_scenes,
                            num_workers == -1 ?
-                               min(static_cast<int64_t>(
+                               max(static_cast<int64_t>(
                                     thread::hardware_concurrency()) - 1, 1l) :
                                num_workers,
                            gpu_id, render_resolution, color, depth,
@@ -802,22 +802,22 @@ public:
         simulateAndRender(group_idx, false, (const int64_t *)action_ptr);
     }
 
-    py::array_t<float> getRewards(uint32_t group_idx)
+    py::array_t<float> getRewards(uint32_t group_idx) const
     {
         return groups_[group_idx].getRewards();
     }
 
-    py::array_t<float> getMasks(uint32_t group_idx)
+    py::array_t<float> getMasks(uint32_t group_idx) const
     {
         return groups_[group_idx].getMasks();
     }
 
-    py::array_t<StepInfo> getInfos(uint32_t group_idx)
+    py::array_t<StepInfo> getInfos(uint32_t group_idx) const
     {
         return groups_[group_idx].getInfos();
     }
 
-    py::array_t<float> getPolars(uint32_t group_idx)
+    py::array_t<float> getPolars(uint32_t group_idx) const
     {
         return groups_[group_idx].getPolars();
     }
