@@ -564,9 +564,12 @@ private:
                                               SimulatorConfig::CAM_FWD_VECTOR);
                 glm::vec3 new_pos = position_ + delta;
 
-                const esp::vec3f filtered_pos = pathfinder_->tryStep(
-                    Eigen::Map<const esp::vec3f>(glm::value_ptr(position_)),
-                    Eigen::Map<const esp::vec3f>(glm::value_ptr(new_pos)));
+                const esp::vec3f filtered_pos =
+                    pathfinder_->tryStep<esp::vec3f>(
+                        Eigen::Map<const esp::vec3f>(
+                                glm::value_ptr(position_)),
+                        Eigen::Map<const esp::vec3f>(
+                                glm::value_ptr(new_pos)));
 
                 position_ = glm::make_vec3(filtered_pos.data());
                 break;
