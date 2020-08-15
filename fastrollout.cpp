@@ -836,7 +836,8 @@ public:
     }
 
     // action_ptr is a uint64_t to match torch.tensor.data_ptr()
-    void step(uint32_t group_idx, const uint64_t action_ptr)
+    void step(uint32_t group_idx,
+              const py::array_t<int64_t, py::array::c_style> &actions)
     {
         if (next_scene_future_.valid() && isReady(next_scene_future_)) {
             next_scene_ = next_scene_future_.get();
@@ -844,7 +845,9 @@ public:
                                    memory_order_relaxed);
         }
 
-        simulateAndRender(group_idx, false, (const int64_t *)action_ptr);
+        auto action_raw = actions.unchecked<1>();
+
+        simulateAndRender(group_idx, false, action_raw.data(0));
 
         if (next_scene_ != nullptr &&
             num_scene_loads_.load(memory_order_relaxed) == 0) {
