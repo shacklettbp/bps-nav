@@ -534,24 +534,25 @@ private:
     {
         // Update renderer view matrix (World -> Camera)
         glm::mat3 rot = glm::mat3_cast(rotation_);
-        glm::mat4 new_view(glm::transpose(rot));
+        glm::mat3 transposed_rot = glm::transpose(rot);
+        glm::mat4 new_view(transposed_rot);
 
         glm::vec3 eye_pos = position_ + SimulatorConfig::UP_VECTOR * 1.25f;
 
-        glm::vec4 translate(rot * eye_pos, 1.f);
-        new_view[3] = -translate;
+        glm::vec4 translate(transposed_rot * -eye_pos, 1.f);
+        new_view[3] = translate;
 
         render_env_->setCameraView(new_view);
 
         // Write out polar coordinates
         glm::vec3 to_goal = goal_ - position_;
-        glm::vec3 to_goal_view = rot * to_goal;
+        glm::vec3 to_goal_view = transposed_rot * to_goal;
 
         auto cartesianToPolar = [](float x, float y) {
             float rho = glm::length(glm::vec2(x, y));
             float phi = atan2f(y, x);
 
-            return glm::vec2(rho, phi);
+            return glm::vec2(rho, -phi);
         };
 
         *outputs_.polar = cartesianToPolar(-to_goal_view.z, to_goal_view.x);
@@ -702,7 +703,7 @@ public:
         return !scene_tracker.isConsistent();
     }
 
-    void swapScene(uint32_t env_idx, const shared_ptr<Scene> &scene_data)
+    void swapScene(uint32_t env_idx, const shared_ptr<Scene> &scene_data, std::mt19937& rgen)
     {
         render_envs_[env_idx] =
             cmd_strm_.makeEnvironment(scene_data, 90, 0.01, 1000);
@@ -718,7 +719,7 @@ public:
             Simulator(scene_episodes, scene_navmesh,
                       render_envs_[env_idx],
                       getPointers(env_idx),
-                      rgen_);
+                      rgen);
     }
 
 private:
@@ -785,12 +786,12 @@ public:
                      uint32_t num_environments, uint32_t num_active_scenes,
                      int num_workers, int gpu_id,
                      const array<uint32_t, 2> &render_resolution,
-                     bool color, bool depth, bool double_buffered)
+                     bool color, bool depth, bool double_buffered, uint64_t seed)
         : RolloutGenerator(dataset_path, asset_path,
                            num_environments, num_active_scenes,
                            computeNumWorkers(num_workers),
                            gpu_id, render_resolution, color, depth,
-                           double_buffered ? 2u : 1u)
+                           double_buffered ? 2u : 1u, seed)
     {}
 
     ~RolloutGenerator()
@@ -896,7 +897,7 @@ private:
                     uint32_t num_environments, uint32_t num_active_scenes,
                     uint32_t num_workers, int gpu_id,
                     const array<uint32_t, 2> &render_resolution,
-                    bool color, bool depth, uint32_t num_groups)
+                    bool color, bool depth, uint32_t num_groups, uint64_t seed)
         : dataset_(dataset_path, asset_path, num_workers),
           renderer_(makeRenderer(gpu_id, num_environments / num_groups,
                                  render_resolution,
@@ -907,8 +908,7 @@ private:
           next_scene_future_(),
           next_scene_(),
           envs_per_scene_(num_environments / num_active_scenes),
-          rd_(),
-          rgen_(rd_()),
+          rgen_(seed),
           active_scenes_(),
           inactive_scenes_(),
           groups_(),
@@ -973,8 +973,8 @@ private:
             }
 
             worker_threads_.emplace_back(
-                    [this, thread_env_offset, thread_num_envs]() {
-                simulationWorker(thread_env_offset, thread_num_envs);
+                    [this, thread_env_offset, thread_num_envs, seed]() {
+                simulationWorker(thread_env_offset, thread_num_envs, seed + thread_env_offset);
             });
 
             thread_env_offset += thread_num_envs;
@@ -998,9 +998,10 @@ private:
         groups_[active_group].render();
     }
 
-    void simulationWorker(uint32_t first_env_idx, uint32_t num_envs)
+    void simulationWorker(uint32_t first_env_idx, uint32_t num_envs, uint64_t seed)
     {
         uint32_t end_env_idx = first_env_idx + num_envs;
+        mt19937 rgen{seed};
 
         while (true) {
             pthread_barrier_wait(&start_barrier_);
@@ -1022,7 +1023,7 @@ private:
 
                     if (done && next_scene_ != nullptr &&
                             group.swapReady(env_idx)) {
-                        group.swapScene(env_idx, next_scene_);
+                        group.swapScene(env_idx, next_scene_, rgen);
                         num_scene_loads_.fetch_sub(1, memory_order_relaxed);
                     }
 
@@ -1045,7 +1046,6 @@ private:
     shared_ptr<Scene> next_scene_;
     uint32_t envs_per_scene_;
 
-    random_device rd_;
     mt19937 rgen_;
     vector<uint32_t> active_scenes_;
     vector<uint32_t> inactive_scenes_;
@@ -1066,11 +1066,12 @@ PYBIND11_MODULE(ddppo_fastrollout, m) {
         .def(py::init<const string &, const string &,
                       uint32_t, uint32_t, int, int,
                       const array<uint32_t, 2> &,
-                      bool, bool, bool>())
+                      bool, bool, bool, uint64_t>())
         .def("step", &RolloutGenerator::step)
         .def("reset", &RolloutGenerator::reset)
         .def("rgba", &RolloutGenerator::getColorMemory)
         .def("depth", &RolloutGenerator::getDepthMemory)
+        .def("get_cuda_semaphore", &RolloutGenerator::getCUDASemaphore)
         .def("get_rewards", &RolloutGenerator::getRewards)
         .def("get_masks", &RolloutGenerator::getMasks)
         .def("get_infos", &RolloutGenerator::getInfos)
