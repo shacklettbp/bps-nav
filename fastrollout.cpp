@@ -625,7 +625,6 @@ public:
                      const Span<uint32_t> &initial_scene_indices)
         : cmd_strm_(strm),
           dataset_(dataset),
-          rgen_(rgen),
           render_envs_(),
           sim_states_(),
           env_scenes_(),
@@ -653,7 +652,7 @@ public:
                 sim_states_.emplace_back(scene_episodes, scene_navmesh,
                                          render_envs_.back(),
                                          getPointers(sim_states_.size()),
-                                         rgen_);
+                                         rgen);
                 env_scenes_.emplace_back(&scene_idx);
             }
         }
@@ -761,7 +760,6 @@ private:
 
     CommandStreamCUDA &cmd_strm_;
     const Dataset &dataset_;
-    mt19937 &rgen_;
     vector<Environment> render_envs_;
     vector<Simulator> sim_states_;
     vector<SceneTracker> env_scenes_;
