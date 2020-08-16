@@ -1,3 +1,5 @@
 /build
-/out
-/v4r_example.egg-info
+/python/ddppo_fastrollout/*
+!/python/ddppo_fastrollout/setup.py
+/python/pytorch/*
+!/python/pytorch/setup.py
