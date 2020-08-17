@@ -418,10 +418,22 @@ struct ResultPointers {
     glm::vec2 *polar;
 };
 
+static inline float computeGeoDist(const esp::nav::NavMeshPoint &start,
+                                   const esp::nav::NavMeshPoint &end,
+                                   esp::nav::PathFinder &pathfinder)
+{
+    esp::nav::ShortestPath test_path;
+
+    test_path.requestedStart = start;
+    test_path.requestedEnd = end;
+
+    pathfinder.findPath(test_path);
+    return test_path.geodesicDistance;
+}
+
 class Simulator {
 public:
     Simulator(Span<const Episode> episodes,
-              string_view navmesh_path,
               Environment &render_env,
               ResultPointers ptrs,
               mt19937 &rgen)
@@ -430,7 +442,6 @@ public:
           episode_order_(),
           render_env_(&render_env),
           outputs_(ptrs),
-          pathfinder_(make_unique<esp::nav::PathFinder>()),
           position_(),
           rotation_(),
           goal_(),
@@ -447,15 +458,9 @@ public:
         }
 
         shuffle(episode_order_.begin(), episode_order_.end(), rgen);
-
-        bool navmesh_success = pathfinder_->loadNavMesh(string(navmesh_path));
-        if (!navmesh_success) {
-            cerr << "Failed to load navmesh: " << navmesh_path << endl;
-            abort();
-        }
     }
 
-    void reset()
+    void reset(esp::nav::PathFinder &pathfinder)
     {
         step_ = 1;
 
@@ -463,13 +468,14 @@ public:
         position_ = episode.startPosition;
         rotation_ = episode.startRotation;
         goal_ = episode.goal;
-        navmeshGoal_ = pathfinder_->snapPoint(
+        navmeshGoal_ = pathfinder.snapPoint(
             Eigen::Map<const esp::vec3f>(glm::value_ptr(episode.goal)));
-        navmeshPosition_ = pathfinder_->snapPoint(
+        navmeshPosition_ = pathfinder.snapPoint(
             Eigen::Map<const esp::vec3f>(glm::value_ptr(position_)));
 
         cumulative_travel_distance_ = 0;
-        initial_distance_to_goal_ = geoDist(navmeshPosition_, navmeshGoal_);
+        initial_distance_to_goal_ =
+            computeGeoDist(navmeshPosition_, navmeshGoal_, pathfinder);
         prev_distance_to_goal_ = initial_distance_to_goal_;
 
         updateObservationState();
@@ -477,7 +483,7 @@ public:
         cur_episode_++;
     }
 
-    bool step(int64_t raw_action)
+    bool step(int64_t raw_action, esp::nav::PathFinder &pathfinder)
     {
         SimAction action {raw_action};
         step_++;
@@ -489,17 +495,19 @@ public:
 
         if (action == SimAction::Stop) {
             done = true;
-            distance_to_goal = geoDist(navmeshGoal_, navmeshPosition_);
+            distance_to_goal =
+                computeGeoDist(navmeshGoal_, navmeshPosition_, pathfinder);
             success =
                 float(distance_to_goal <= SimulatorConfig::SUCCESS_DISTANCE);
             reward += success * SimulatorConfig::SUCCESS_REWARD;
         } else {
             glm::vec3 prev_position = position_;
 
-            handleMovement(action);
+            handleMovement(action, pathfinder);
             updateObservationState();
 
-            distance_to_goal = geoDist(navmeshGoal_, navmeshPosition_);
+            distance_to_goal =
+                computeGeoDist(navmeshGoal_, navmeshPosition_, pathfinder);
             reward += prev_distance_to_goal_ - distance_to_goal;
             cumulative_travel_distance_ +=
                 glm::length(position_ - prev_position);
@@ -533,18 +541,6 @@ private:
         TurnRight = 3
     };
 
-    inline float geoDist(const esp::nav::NavMeshPoint &start,
-                         const esp::nav::NavMeshPoint &end)
-    {
-        esp::nav::ShortestPath test_path;
-
-        test_path.requestedStart = start;
-        test_path.requestedEnd = end;
-
-        pathfinder_->findPath(test_path);
-        return test_path.geodesicDistance;
-    }
-
     inline void updateObservationState()
     {
         // Update renderer view matrix (World -> Camera)
@@ -573,7 +569,8 @@ private:
         *outputs_.polar = cartesianToPolar(-to_goal_view.z, to_goal_view.x);
     }
 
-    inline void handleMovement(SimAction action)
+    inline void handleMovement(SimAction action,
+                               esp::nav::PathFinder &pathfinder)
     {
         switch (action) {
             case SimAction::MoveForward: {
@@ -581,7 +578,7 @@ private:
                     glm::rotate(rotation_, SimulatorConfig::CAM_FWD_VECTOR);
                 glm::vec3 new_pos = position_ + delta;
 
-                navmeshPosition_ = pathfinder_->tryStep(
+                navmeshPosition_ = pathfinder.tryStep(
                     navmeshPosition_,
                     Eigen::Map<const esp::vec3f>(glm::value_ptr(new_pos)));
 
@@ -609,7 +606,6 @@ private:
     vector<uint32_t> episode_order_;
     Environment *render_env_;
     ResultPointers outputs_;
-    unique_ptr<esp::nav::PathFinder> pathfinder_;
 
     glm::vec3 position_;
     glm::quat rotation_;
@@ -663,24 +659,19 @@ public:
             auto scene = loader.loadScene(scene_path);
 
             auto scene_episodes = dataset_.getEpisodes(scene_idx);
-            auto scene_navmesh = dataset_.getNavmeshPath(scene_idx);
 
             for (uint32_t env_idx = 0; env_idx < envs_per_scene; env_idx++) {
                 render_envs_.emplace_back(
                     strm.makeEnvironment(scene, 90, 0.1, 1000));
-                sim_states_.emplace_back(
-                    scene_episodes, scene_navmesh, render_envs_.back(),
-                    getPointers(sim_states_.size()), rgen);
+                sim_states_.emplace_back(scene_episodes, render_envs_.back(),
+                                         getPointers(sim_states_.size()),
+                                         rgen);
                 env_scenes_.emplace_back(&scene_idx);
             }
         }
     }
 
     void render() { cmd_strm_.render(render_envs_); }
-
-    Simulator &getSimulator(uint32_t idx) { return sim_states_[idx]; }
-
-    Environment &getEnvironment(uint32_t idx) { return render_envs_[idx]; }
 
     py::array_t<float> getRewards() const
     {
@@ -701,6 +692,21 @@ public:
                                   &polars_[0].x, py::none());
     }
 
+    inline bool step(uint32_t env_idx,
+                     int64_t action,
+                     vector<esp::nav::PathFinder> &pathfinders)
+    {
+        auto &pathfinder = pathfinders[env_scenes_[env_idx].curScene()];
+        return sim_states_[env_idx].step(action, pathfinder);
+    }
+
+    inline void reset(uint32_t env_idx,
+                      vector<esp::nav::PathFinder> &pathfinders)
+    {
+        auto &pathfinder = pathfinders[env_scenes_[env_idx].curScene()];
+        sim_states_[env_idx].reset(pathfinder);
+    }
+
     bool swapReady(uint32_t env_idx) const
     {
         const auto &scene_tracker = env_scenes_[env_idx];
@@ -719,11 +725,9 @@ public:
         uint32_t scene_idx = scene_tracker.curScene();
 
         auto scene_episodes = dataset_.getEpisodes(scene_idx);
-        auto scene_navmesh = dataset_.getNavmeshPath(scene_idx);
 
-        sim_states_[env_idx] =
-            Simulator(scene_episodes, scene_navmesh, render_envs_[env_idx],
-                      getPointers(env_idx), rgen);
+        sim_states_[env_idx] = Simulator(scene_episodes, render_envs_[env_idx],
+                                         getPointers(env_idx), rgen);
     }
 
 private:
@@ -996,6 +1000,11 @@ private:
 
             thread_env_offset += thread_num_envs;
         }
+
+        // Wait for all threads to reach the start of the their work loop.
+        // Not strictly necessary but ensures the first step doesn't take
+        // longer as pathfinders are initialized
+        pthread_barrier_wait(&finish_barrier_);
     }
 
     void simulateAndRender(uint32_t active_group,
@@ -1016,12 +1025,31 @@ private:
         groups_[active_group].render();
     }
 
-    void simulationWorker(uint32_t first_env_idx,
+    void simulationWorker(uint32_t begin_env_idx,
                           uint32_t num_envs,
                           uint64_t seed)
     {
-        uint32_t end_env_idx = first_env_idx + num_envs;
+        uint32_t end_env_idx = begin_env_idx + num_envs;
         mt19937 rgen {seed};
+
+        vector<esp::nav::PathFinder> thread_pathfinders(dataset_.numScenes());
+
+        for (uint32_t scene_idx = 0; scene_idx < dataset_.numScenes();
+             scene_idx++) {
+            auto navmesh_path = dataset_.getNavmeshPath(scene_idx);
+
+            bool navmesh_success = thread_pathfinders[scene_idx].loadNavMesh(
+                string(navmesh_path));
+
+            if (!navmesh_success) {
+                cerr << "Failed to load navmesh: " << navmesh_path << endl;
+                abort();
+            }
+        }
+
+        vector<ThreadEnv> 
+
+        pthread_barrier_wait(&finish_barrier_);
 
         while (true) {
             pthread_barrier_wait(&start_barrier_);
@@ -1032,14 +1060,13 @@ private:
             const bool trigger_reset = sim_reset_;
 
             EnvironmentGroup &group = groups_[active_group_];
-            for (uint32_t env_idx = first_env_idx; env_idx < end_env_idx;
+            for (uint32_t env_idx = begin_env_idx; env_idx < end_env_idx;
                  env_idx++) {
-                Simulator &sim = group.getSimulator(env_idx);
-
                 if (trigger_reset) {
-                    sim.reset();
+                    group.reset(env_idx, thread_pathfinders);
                 } else {
-                    bool done = sim.step(active_actions_[env_idx]);
+                    bool done = group.step(env_idx, active_actions_[env_idx],
+                                           thread_pathfinders);
 
                     if (done && next_scene_ != nullptr &&
                         group.swapReady(env_idx)) {
@@ -1048,7 +1075,7 @@ private:
                     }
 
                     if (done) {
-                        sim.reset();
+                        group.reset(env_idx, thread_pathfinders);
                     }
                 }
             }

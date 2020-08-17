@@ -27,3 +27,6 @@ Cpp11BracedListStyle: true
 
 SortIncludes: false
 SortUsingDeclarations: false
+
+PenaltyBreakAssignment: 1
+PenaltyBreakBeforeFirstCallParameter: 2
