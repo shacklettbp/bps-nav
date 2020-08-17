@@ -129,8 +129,10 @@ public:
             const string filename = entry.path().string();
             if (string_view(filename).substr(
                     filename.size() - strlen(data_suffix)) == data_suffix) {
-                json_files.push_back(
-                    {filename, filesystem::file_size(entry.path())});
+                json_files.push_back({
+                    filename,
+                    filesystem::file_size(entry.path()),
+                });
             }
         }
 
@@ -204,7 +206,11 @@ public:
                             abort();
                         }
 
-                        episodes.push_back({start_pos, start_rot, goal_pos});
+                        episodes.push_back({
+                            start_pos,
+                            start_rot,
+                            goal_pos,
+                        });
                     }
 
                     if (scene_id.size() > 0) {
@@ -218,12 +224,13 @@ public:
                         string navmesh_suffix =
                             string(scene_id.substr(0, dotpos)) + ".navmesh";
 
-                        scenes.push_back(
-                            {scene_episode_start,
-                             static_cast<uint32_t>(episodes.size() -
-                                                   scene_episode_start),
-                             asset_path_name + "/" + string(scene_id),
-                             asset_path_name + "/" + navmesh_suffix});
+                        scenes.push_back({
+                            scene_episode_start,
+                            static_cast<uint32_t>(episodes.size() -
+                                                  scene_episode_start),
+                            asset_path_name + "/" + string(scene_id),
+                            asset_path_name + "/" + navmesh_suffix,
+                        });
                     }
                 }
 
@@ -291,13 +298,10 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
                 gpu_id,  // gpuID
                 1,       // numLoaders
                 1,       // numStreams
-                renderer_batch_size,
-                resolution[1],
-                resolution[0],
+                renderer_batch_size, resolution[1], resolution[0],
                 glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1,
                           -1.19209e-07, 0, 0, 0, 0,
-                          1)  // Habitat coordinate txfm matrix
-                ,
+                          1),  // Habitat coordinate txfm matrix
             },
             features);
     };
@@ -484,6 +488,7 @@ public:
         if (action == SimAction::Stop) {
             done = true;
             distance_to_goal = geoDist(navmeshGoal_, navmeshPosition_);
+            distance_to_goal = geoDist(goal_, position_);
             success =
                 float(distance_to_goal <= SimulatorConfig::SUCCESS_DISTANCE);
             reward += success * SimulatorConfig::SUCCESS_REWARD;
@@ -505,7 +510,8 @@ public:
             success,
             success * initial_distance_to_goal_ /
                 max(initial_distance_to_goal_, cumulative_travel_distance_),
-            distance_to_goal};
+            distance_to_goal,
+        };
 
         *outputs_.reward = reward;
         if (done) {
@@ -739,8 +745,12 @@ private:
 
     ResultPointers getPointers(uint32_t idx)
     {
-        return ResultPointers {&rewards_[idx], &masks_[idx], &infos_[idx],
-                               &polars_[idx]};
+        return ResultPointers {
+            &rewards_[idx],
+            &masks_[idx],
+            &infos_[idx],
+            &polars_[idx],
+        };
     };
 
     CommandStreamCUDA &cmd_strm_;
