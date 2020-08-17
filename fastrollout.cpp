@@ -434,6 +434,8 @@ public:
           position_(),
           rotation_(),
           goal_(),
+          navmeshPosition_(),
+          navmeshGoal_(),
           initial_distance_to_goal_(),
           prev_distance_to_goal_(),
           cumulative_travel_distance_(),
@@ -488,7 +490,6 @@ public:
         if (action == SimAction::Stop) {
             done = true;
             distance_to_goal = geoDist(navmeshGoal_, navmeshPosition_);
-            distance_to_goal = geoDist(goal_, position_);
             success =
                 float(distance_to_goal <= SimulatorConfig::SUCCESS_DISTANCE);
             reward += success * SimulatorConfig::SUCCESS_REWARD;
@@ -613,9 +614,10 @@ private:
     glm::vec3 position_;
     glm::quat rotation_;
     glm::vec3 goal_;
-    esp::nav::NavMeshPoint navmeshGoal_;
-    ;
+
     esp::nav::NavMeshPoint navmeshPosition_;
+    esp::nav::NavMeshPoint navmeshGoal_;
+
     float initial_distance_to_goal_;
     float prev_distance_to_goal_;
     float cumulative_travel_distance_;
