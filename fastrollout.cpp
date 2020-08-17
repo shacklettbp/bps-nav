@@ -636,6 +636,28 @@ static py::array_t<T> makeFlatNumpyArray(const vector<T> &vec)
     return py::array_t<T>({vec.size()}, {sizeof(T)}, vec.data(), py::none());
 }
 
+class EnvironmentGroup;
+
+class ThreadEnvironment {
+public:
+    ThreadEnvironment(ThreadEnvironment &&) = default;
+
+private:
+    ThreadEnvironment(uint32_t idx,
+                      Simulator &sim,
+                      esp::nav::PathFinder &pathfinder)
+        : idx_(idx),
+          sim_(&sim),
+          pathfinder_(&pathfinder)
+    {}
+
+    uint32_t idx_;
+    Simulator *sim_;
+    esp::nav::PathFinder *pathfinder_;
+
+    friend class EnvironmentGroup;
+};
+
 class EnvironmentGroup {
 public:
     EnvironmentGroup(CommandStreamCUDA &strm,
@@ -698,42 +720,48 @@ public:
                                   &polars_[0].x, py::none());
     }
 
-    inline bool step(uint32_t env_idx,
-                     int64_t action,
-                     vector<esp::nav::PathFinder> &pathfinders)
+    ThreadEnvironment makeThreadEnv(uint32_t env_idx,
+                                    vector<esp::nav::PathFinder> &pathfinders)
     {
-        auto &pathfinder = pathfinders[env_scenes_[env_idx].curScene()];
-        return sim_states_[env_idx].step(action, pathfinder);
+        return ThreadEnvironment(env_idx, sim_states_[env_idx],
+                                 pathfinders[env_scenes_[env_idx].curScene()]);
     }
 
-    inline void reset(uint32_t env_idx,
-                      vector<esp::nav::PathFinder> &pathfinders)
+    inline bool step(const ThreadEnvironment &env, int64_t action)
     {
-        auto &pathfinder = pathfinders[env_scenes_[env_idx].curScene()];
-        sim_states_[env_idx].reset(pathfinder);
+        return env.sim_->step(action, *env.pathfinder_);
     }
 
-    bool swapReady(uint32_t env_idx) const
+    inline void reset(const ThreadEnvironment &env)
     {
-        const auto &scene_tracker = env_scenes_[env_idx];
+        env.sim_->reset(*env.pathfinder_);
+    }
+
+    bool swapReady(const ThreadEnvironment &env) const
+    {
+        const auto &scene_tracker = env_scenes_[env.idx_];
         return !scene_tracker.isConsistent();
     }
 
-    void swapScene(uint32_t env_idx,
+    void swapScene(ThreadEnvironment &env,
                    const shared_ptr<Scene> &scene_data,
+                   vector<esp::nav::PathFinder> &pathfinders,
                    std::mt19937 &rgen)
     {
-        render_envs_[env_idx] =
+        render_envs_[env.idx_] =
             cmd_strm_.makeEnvironment(scene_data, 90, 0.01, 1000);
 
-        auto &scene_tracker = env_scenes_[env_idx];
+        auto &scene_tracker = env_scenes_[env.idx_];
         scene_tracker.update();
         uint32_t scene_idx = scene_tracker.curScene();
 
         auto scene_episodes = dataset_.getEpisodes(scene_idx);
 
-        sim_states_[env_idx] = Simulator(scene_episodes, render_envs_[env_idx],
-                                         getPointers(env_idx), rgen);
+        sim_states_[env.idx_] =
+            Simulator(scene_episodes, render_envs_[env.idx_],
+                      getPointers(env.idx_), rgen);
+
+        env.pathfinder_ = &pathfinders[env_scenes_[env.idx_].curScene()];
     }
 
 private:
@@ -998,11 +1026,12 @@ private:
                 extra_files--;
             }
 
-            worker_threads_.emplace_back(
-                [this, thread_env_offset, thread_num_envs, seed]() {
-                    simulationWorker(thread_env_offset, thread_num_envs,
-                                     seed + thread_env_offset);
-                });
+            worker_threads_.emplace_back([this, thread_env_offset,
+                                          thread_num_envs, num_groups,
+                                          seed]() {
+                simulationWorker(thread_env_offset, thread_num_envs,
+                                 num_groups, seed + thread_env_offset);
+            });
 
             thread_env_offset += thread_num_envs;
         }
@@ -1033,6 +1062,7 @@ private:
 
     void simulationWorker(uint32_t begin_env_idx,
                           uint32_t num_envs,
+                          uint32_t num_groups,
                           uint64_t seed)
     {
         uint32_t end_env_idx = begin_env_idx + num_envs;
@@ -1053,6 +1083,17 @@ private:
             }
         }
 
+        vector<ThreadEnvironment> thread_envs;
+        thread_envs.reserve(num_envs * num_groups);
+
+        for (uint32_t group_idx = 0; group_idx < num_groups; group_idx++) {
+            for (uint32_t env_idx = begin_env_idx; env_idx < end_env_idx;
+                 env_idx++) {
+                thread_envs.emplace_back(groups_[group_idx].makeThreadEnv(
+                    env_idx, thread_pathfinders));
+            }
+        }
+
         pthread_barrier_wait(&finish_barrier_);
 
         while (true) {
@@ -1064,22 +1105,27 @@ private:
             const bool trigger_reset = sim_reset_;
 
             EnvironmentGroup &group = groups_[active_group_];
-            for (uint32_t env_idx = begin_env_idx; env_idx < end_env_idx;
-                 env_idx++) {
+            ThreadEnvironment *group_thread_envs =
+                &thread_envs[active_group_ * num_envs];
+            const int64_t *thread_actions = &active_actions_[begin_env_idx];
+
+            for (uint32_t idx = 0; idx < num_envs; idx++) {
+                ThreadEnvironment &env = group_thread_envs[idx];
+
                 if (trigger_reset) {
-                    group.reset(env_idx, thread_pathfinders);
+                    group.reset(env);
                 } else {
-                    bool done = group.step(env_idx, active_actions_[env_idx],
-                                           thread_pathfinders);
+                    bool done = group.step(env, thread_actions[idx]);
 
                     if (done && next_scene_ != nullptr &&
-                        group.swapReady(env_idx)) {
-                        group.swapScene(env_idx, next_scene_, rgen);
+                        group.swapReady(env)) {
+                        group.swapScene(env, next_scene_, thread_pathfinders,
+                                        rgen);
                         num_scene_loads_.fetch_sub(1, memory_order_relaxed);
                     }
 
                     if (done) {
-                        group.reset(env_idx, thread_pathfinders);
+                        group.reset(env);
                     }
                 }
             }
