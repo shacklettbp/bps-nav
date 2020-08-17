@@ -503,16 +503,21 @@ public:
         } else {
             glm::vec3 prev_position = position_;
 
-            handleMovement(action, pathfinder);
+            bool position_updated = handleMovement(action, pathfinder);
             updateObservationState();
 
-            distance_to_goal =
-                computeGeoDist(navmeshGoal_, navmeshPosition_, pathfinder);
-            reward += prev_distance_to_goal_ - distance_to_goal;
-            cumulative_travel_distance_ +=
-                glm::length(position_ - prev_position);
+            if (position_updated) {
+                distance_to_goal =
+                    computeGeoDist(navmeshGoal_, navmeshPosition_, pathfinder);
+                reward += prev_distance_to_goal_ - distance_to_goal;
 
-            prev_distance_to_goal_ = distance_to_goal;
+                cumulative_travel_distance_ +=
+                    glm::length(position_ - prev_position);
+
+                prev_distance_to_goal_ = distance_to_goal;
+            } else {
+                distance_to_goal = prev_distance_to_goal_;
+            }
         }
 
         StepInfo info {
@@ -569,7 +574,8 @@ private:
         *outputs_.polar = cartesianToPolar(-to_goal_view.z, to_goal_view.x);
     }
 
-    inline void handleMovement(SimAction action,
+    // Returns true when position updated
+    inline bool handleMovement(SimAction action,
                                esp::nav::PathFinder &pathfinder)
     {
         switch (action) {
@@ -583,15 +589,15 @@ private:
                     Eigen::Map<const esp::vec3f>(glm::value_ptr(new_pos)));
 
                 position_ = glm::make_vec3(navmeshPosition_.xyz.data());
-                break;
+                return true;
             }
             case SimAction::TurnLeft: {
                 rotation_ = SimulatorConfig::LEFT_ROTATION * rotation_;
-                break;
+                return false;
             }
             case SimAction::TurnRight: {
                 rotation_ = SimulatorConfig::RIGHT_ROTATION * rotation_;
-                break;
+                return false;
             }
             default: {
                 cerr << "Unknown action: " << static_cast<int64_t>(action)
@@ -1046,8 +1052,6 @@ private:
                 abort();
             }
         }
-
-        vector<ThreadEnv> 
 
         pthread_barrier_wait(&finish_barrier_);
 
