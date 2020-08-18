@@ -41,9 +41,9 @@ constexpr glm::vec3 UP_VECTOR(0.f, 1.f, 0.f);
 constexpr glm::vec3 CAM_FWD_VECTOR =
     glm::vec3(0.f, 0.f, -1.f) * FORWARD_STEP_SIZE;
 
-static const glm::quat LEFT_ROTATION = glm::angleAxis(-TURN_ANGLE, UP_VECTOR);
+static const glm::quat LEFT_ROTATION = glm::angleAxis(TURN_ANGLE, UP_VECTOR);
 
-static const glm::quat RIGHT_ROTATION = glm::angleAxis(TURN_ANGLE, UP_VECTOR);
+static const glm::quat RIGHT_ROTATION = glm::angleAxis(-TURN_ANGLE, UP_VECTOR);
 }
 
 template <typename T>
@@ -592,11 +592,11 @@ private:
                 return true;
             }
             case SimAction::TurnLeft: {
-                rotation_ = SimulatorConfig::LEFT_ROTATION * rotation_;
+                rotation_ = rotation_ * SimulatorConfig::LEFT_ROTATION;
                 return false;
             }
             case SimAction::TurnRight: {
-                rotation_ = SimulatorConfig::RIGHT_ROTATION * rotation_;
+                rotation_ = rotation_ * SimulatorConfig::RIGHT_ROTATION;
                 return false;
             }
             default: {
