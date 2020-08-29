@@ -14,7 +14,12 @@ message(STATUS "Bindings being generated for python at ${PYTHON_EXECUTABLE}")
 
 add_subdirectory(v4r EXCLUDE_FROM_ALL)
 add_subdirectory(pybind11)
-add_subdirectory(simdjson EXCLUDE_FROM_ALL)
+
+if (NOT TARGET simdjson)
+    set(SIMDJSON_JUST_LIBRARY ON CACHE INTERNAL "")
+    set(SIMDJSON_BUILD_STATIC ON CACHE INTERNAL "")
+    add_subdirectory(simdjson EXCLUDE_FROM_ALL)
+endif()
 
 add_library(habitat_sim_geodesic SHARED
     habitat-sim-geodesic/habitat_sim_geodesic/csrc/recastnavigation-master/Detour/Source/DetourNode.cpp
