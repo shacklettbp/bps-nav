@@ -490,16 +490,19 @@ public:
         bool done = step_ >= SimulatorConfig::MAX_STEPS;
         float reward = -SimulatorConfig::SLACK_REWARD;
 
-        float success = 0;
         float distance_to_goal = 0;
+        float success = 0;
+        float spl = 0;
 
         if (action == SimAction::Stop) {
             done = true;
             distance_to_goal =
                 computeGeoDist(navmeshGoal_, navmeshPosition_, pathfinder);
             success =
-                float(distance_to_goal <= SimulatorConfig::SUCCESS_DISTANCE);
-            reward += success * SimulatorConfig::SUCCESS_REWARD;
+                float(distance_to_goal < SimulatorConfig::SUCCESS_DISTANCE);
+            spl = success * initial_distance_to_goal_ /
+                  max(initial_distance_to_goal_, cumulative_travel_distance_),
+            reward += spl * SimulatorConfig::SUCCESS_REWARD;
         } else {
             glm::vec3 prev_position = position_;
 
@@ -522,8 +525,7 @@ public:
 
         StepInfo info {
             success,
-            success * initial_distance_to_goal_ /
-                max(initial_distance_to_goal_, cumulative_travel_distance_),
+            spl,
             distance_to_goal,
         };
 
