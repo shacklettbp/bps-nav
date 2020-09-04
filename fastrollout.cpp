@@ -282,6 +282,7 @@ private:
 
 BatchRendererCUDA makeRenderer(int32_t gpu_id,
                                uint32_t renderer_batch_size,
+                               uint32_t num_loaders,
                                const array<uint32_t, 2> &resolution,
                                bool color,
                                bool depth,
@@ -291,13 +292,14 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
     if (doubleBuffered) {
         options |= RenderOptions::DoubleBuffered;
     }
+    // options |= RenderOptions::CpuSynchronization;
 
     auto make = [&](auto features) {
         return BatchRendererCUDA(
             {
-                gpu_id,  // gpuID
-                1,       // numLoaders
-                1,       // numStreams
+                gpu_id,       // gpuID
+                num_loaders,  // numLoaders
+                1,            // numStreams
                 renderer_batch_size, resolution[1], resolution[0],
                 glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1,
                           -1.19209e-07, 0, 0, 0, 0,
@@ -391,7 +393,9 @@ private:
                 loader_requests_.pop();
             }
 
+            std::cout << "Loading scene" << std::endl;
             auto scene = loader_.loadScene(scene_path);
+            std::cout << "Loaded scene" << std::endl;
             loader_promise.set_value(move(scene));
         }
     };
@@ -502,7 +506,10 @@ public:
                 float(distance_to_goal < SimulatorConfig::SUCCESS_DISTANCE);
             spl = success * initial_distance_to_goal_ /
                   max(initial_distance_to_goal_, cumulative_travel_distance_),
-            reward += spl * SimulatorConfig::SUCCESS_REWARD;
+            reward += SimulatorConfig::SUCCESS_REWARD * spl *
+                      (0.5 + max(1.0 - distance_to_goal /
+                                           SimulatorConfig::SUCCESS_DISTANCE,
+                                 0.5));
         } else {
             glm::vec3 prev_position = position_;
 
@@ -815,6 +822,91 @@ static uint32_t computeNumWorkers(int num_desired_workers)
                num_desired_workers;
 }
 
+class SceneSwapper {
+public:
+    SceneSwapper(AssetLoader &&loader,
+                 Dataset &dataset,
+                 uint32_t &active_scene,
+                 std::vector<uint32_t> &inactive_scenes,
+                 uint32_t envs_per_scene,
+                 mt19937 &rgen)
+        : loader_ {std::move(loader)},
+          dataset_ {dataset},
+          active_scene_ {active_scene},
+          inactive_scenes_ {inactive_scenes},
+          envs_per_scene_ {envs_per_scene},
+          rgen_ {rgen},
+          num_scene_loads_ {0},
+          next_scene_future_ {},
+          next_scene_ {}
+    {}
+
+    SceneSwapper() = delete;
+    SceneSwapper(const SceneSwapper &) = delete;
+    SceneSwapper(SceneSwapper &&) = default;
+
+    bool canSwapScene() const
+    {
+        return next_scene_ == nullptr && !next_scene_future_.valid();
+    }
+
+    void startSceneSwap()
+    {
+        assert(canSwapScene());
+        uniform_int_distribution<uint32_t> scene_selector(
+            0, inactive_scenes_.size() - 1);
+
+        uint32_t new_scene_position = scene_selector(rgen_);
+
+        swap(inactive_scenes_[new_scene_position], active_scene_);
+
+        auto scene_path = dataset_.getScenePath(active_scene_);
+
+        next_scene_future_ = loader_.asyncLoadScene(scene_path);
+    }
+
+    void preStep()
+    {
+        if (canSwapScene()) startSceneSwap();
+        std::cout << "Pre enter" << std::endl;
+        if (next_scene_future_.valid() && isReady(next_scene_future_)) {
+            next_scene_ = next_scene_future_.get();
+            num_scene_loads_.store(envs_per_scene_, memory_order_relaxed);
+        }
+        std::cout << "Pre exit" << std::endl;
+    }
+
+    void postStep()
+    {
+        std::cout << "Post enter" << std::endl;
+        if (next_scene_ != nullptr &&
+            num_scene_loads_.load(memory_order_relaxed) == 0) {
+            next_scene_ = nullptr;
+        }
+        std::cout << "Post exit" << std::endl;
+    }
+
+    void oneLoaded() { num_scene_loads_.fetch_sub(1, memory_order_relaxed); }
+
+    BackgroundSceneLoader &getLoader() { return loader_; }
+    shared_ptr<Scene> getNextScene() { return next_scene_; }
+    atomic_uint32_t &getNumSceneLoads() { return num_scene_loads_; }
+
+private:
+    BackgroundSceneLoader loader_;
+    Dataset &dataset_;
+
+    uint32_t &active_scene_;
+    vector<uint32_t> &inactive_scenes_;
+    uint32_t envs_per_scene_;
+
+    mt19937 &rgen_;
+
+    atomic_uint32_t num_scene_loads_;
+    future<shared_ptr<Scene>> next_scene_future_;
+    shared_ptr<Scene> next_scene_;
+};
+
 class RolloutGenerator {
 public:
     RolloutGenerator(const string &dataset_path,
@@ -854,31 +946,6 @@ public:
         pthread_barrier_destroy(&finish_barrier_);
     }
 
-    bool canSwapScene() const
-    {
-        return next_scene_ == nullptr && !next_scene_future_.valid();
-    }
-
-    void triggerSwapScene(uint32_t active_scene_idx)
-    {
-        assert(canSwapScene());
-        assert(active_scene_idx < active_scenes_.size());
-
-        uniform_int_distribution<uint32_t> scene_selector(
-            0, inactive_scenes_.size() - 1);
-
-        uint32_t new_scene_position = scene_selector(rgen_);
-
-        swap(inactive_scenes_[new_scene_position],
-             active_scenes_[active_scene_idx]);
-
-        uint32_t scene_idx = active_scenes_[active_scene_idx];
-
-        auto scene_path = dataset_.getScenePath(scene_idx);
-
-        next_scene_future_ = loader_.asyncLoadScene(scene_path);
-    }
-
     void reset(uint32_t group_idx)
     {
         simulateAndRender(group_idx, true, nullptr);
@@ -888,19 +955,13 @@ public:
     void step(uint32_t group_idx,
               const py::array_t<int64_t, py::array::c_style> &actions)
     {
-        if (next_scene_future_.valid() && isReady(next_scene_future_)) {
-            next_scene_ = next_scene_future_.get();
-            num_scene_loads_.store(envs_per_scene_, memory_order_relaxed);
-        }
+        for (auto &swapper : scene_swappers_) swapper->preStep();
 
         auto action_raw = actions.unchecked<1>();
 
         simulateAndRender(group_idx, false, action_raw.data(0));
 
-        if (next_scene_ != nullptr &&
-            num_scene_loads_.load(memory_order_relaxed) == 0) {
-            next_scene_ = nullptr;
-        }
+        for (auto &swapper : scene_swappers_) swapper->postStep();
     }
 
     py::array_t<float> getRewards(uint32_t group_idx) const
@@ -938,6 +999,11 @@ public:
         return py::capsule(cmd_strm_.getCudaSemaphore(groupIdx));
     }
 
+    void waitForFrame(const uint32_t groupIdx)
+    {
+        cmd_strm_.waitForFrame(groupIdx);
+    }
+
 private:
     RolloutGenerator(const string &dataset_path,
                      const string &asset_path,
@@ -953,19 +1019,16 @@ private:
         : dataset_(dataset_path, asset_path, num_workers),
           renderer_(makeRenderer(gpu_id,
                                  num_environments / num_groups,
+                                 num_active_scenes,
                                  render_resolution,
                                  color,
                                  depth,
                                  num_groups == 2)),
           cmd_strm_(renderer_.makeCommandStream()),
-          loader_(renderer_.makeLoader()),
-          num_scene_loads_(0),
-          next_scene_future_(),
-          next_scene_(),
           envs_per_scene_(num_environments / num_active_scenes),
-          rgen_(seed),
           active_scenes_(),
           inactive_scenes_(),
+          rgen_(seed),
           groups_(),
           worker_threads_(),
           start_barrier_(),
@@ -1005,20 +1068,29 @@ private:
         assert(num_environments % num_active_scenes == 0);
         assert(num_active_scenes % num_groups == 0);
 
-        uint32_t envs_per_group = num_environments / num_groups;
+        scene_swappers_.reserve(num_active_scenes);
+        for (uint32_t i = 0; i < num_active_scenes; ++i)
+            scene_swappers_.emplace_back(new SceneSwapper {
+                renderer_.makeLoader(), dataset_, active_scenes_[i],
+                inactive_scenes_, envs_per_scene_, rgen_});
+
+        envs_per_group_ = num_environments / num_groups;
         uint32_t scenes_per_group = num_active_scenes / num_groups;
 
         for (uint32_t i = 0; i < num_groups; i++) {
             groups_.emplace_back(
-                cmd_strm_, loader_, dataset_, rgen_, envs_per_scene_,
+                cmd_strm_, scene_swappers_.front()->getLoader(), dataset_,
+                rgen_, envs_per_scene_,
                 Span(&active_scenes_[i * scenes_per_group], scenes_per_group));
         }
+
+        for (auto &swapper : scene_swappers_) swapper->startSceneSwap();
 
         pthread_barrier_init(&start_barrier_, nullptr, num_workers + 1);
         pthread_barrier_init(&finish_barrier_, nullptr, num_workers + 1);
 
-        uint32_t envs_per_thread = envs_per_group / num_workers;
-        uint32_t extra_files = envs_per_group - envs_per_thread * num_workers;
+        uint32_t envs_per_thread = envs_per_group_ / num_workers;
+        uint32_t extra_files = envs_per_group_ - envs_per_thread * num_workers;
 
         uint32_t thread_env_offset = 0;
         for (uint32_t thread_idx = 0; thread_idx < num_workers; thread_idx++) {
@@ -1068,7 +1140,7 @@ private:
                           uint64_t seed)
     {
         uint32_t end_env_idx = begin_env_idx + num_envs;
-        mt19937 rgen {seed};
+        mt19937 rgen(seed);
 
         vector<esp::nav::PathFinder> thread_pathfinders(dataset_.numScenes());
 
@@ -1119,36 +1191,42 @@ private:
                 } else {
                     bool done = group.step(env, thread_actions[idx]);
 
-                    if (done && next_scene_ != nullptr &&
-                        group.swapReady(env)) {
-                        group.swapScene(env, next_scene_, thread_pathfinders,
-                                        rgen);
-                        num_scene_loads_.fetch_sub(1, memory_order_relaxed);
-                    }
-
                     if (done) {
+                        uint32_t global_env_idx =
+                            active_group_ * envs_per_group_ + begin_env_idx +
+                            idx;
+
+                        uint32_t scene_group_idx =
+                            global_env_idx / envs_per_scene_;
+
+                        auto next_scene =
+                            scene_swappers_[scene_group_idx]->getNextScene();
+                        if (next_scene != nullptr && group.swapReady(env)) {
+                            group.swapScene(env, next_scene,
+                                            thread_pathfinders, rgen);
+                            scene_swappers_[scene_group_idx]->oneLoaded();
+                        }
+
                         group.reset(env);
                     }
                 }
-            }
 
-            pthread_barrier_wait(&finish_barrier_);
+                pthread_barrier_wait(&finish_barrier_);
+            }
         }
     }
 
     Dataset dataset_;
     BatchRendererCUDA renderer_;
     CommandStreamCUDA cmd_strm_;
-    BackgroundSceneLoader loader_;
-    atomic_uint32_t num_scene_loads_;
-    future<shared_ptr<Scene>> next_scene_future_;
-    shared_ptr<Scene> next_scene_;
     uint32_t envs_per_scene_;
-
-    mt19937 rgen_;
+    uint32_t envs_per_group_;
     vector<uint32_t> active_scenes_;
     vector<uint32_t> inactive_scenes_;
+
+    mt19937 rgen_;
     vector<EnvironmentGroup> groups_;
+    vector<unique_ptr<SceneSwapper>> scene_swappers_;
 
     vector<thread> worker_threads_;
     pthread_barrier_t start_barrier_;
@@ -1166,6 +1244,7 @@ PYBIND11_MODULE(ddppo_fastrollout, m)
         .def(py::init<const string &, const string &, uint32_t, uint32_t, int,
                       int, const array<uint32_t, 2> &, bool, bool, bool,
                       uint64_t>())
+        .def("wait_for_frame", &RolloutGenerator::waitForFrame)
         .def("step", &RolloutGenerator::step)
         .def("reset", &RolloutGenerator::reset)
         .def("rgba", &RolloutGenerator::getColorMemory)
@@ -1174,7 +1253,5 @@ PYBIND11_MODULE(ddppo_fastrollout, m)
         .def("get_rewards", &RolloutGenerator::getRewards)
         .def("get_masks", &RolloutGenerator::getMasks)
         .def("get_infos", &RolloutGenerator::getInfos)
-        .def("get_polars", &RolloutGenerator::getPolars)
-        .def("can_swap_scene", &RolloutGenerator::canSwapScene)
-        .def("trigger_swap_scene", &RolloutGenerator::triggerSwapScene);
+        .def("get_polars", &RolloutGenerator::getPolars);
 }
