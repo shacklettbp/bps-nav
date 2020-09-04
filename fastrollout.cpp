@@ -51,8 +51,7 @@ class Span {
 public:
     Span(T *base, size_t num_elems) : ptr_(base), num_elems_(num_elems) {}
 
-    T &operator[](size_t idx) { return ptr_[idx]; }
-    const T &operator[](size_t idx) const { return ptr_[idx]; }
+    T &operator[](size_t idx) const { return ptr_[idx]; }
 
     T *begin() { return ptr_; }
     const T *begin() const { return ptr_; }
@@ -78,6 +77,35 @@ struct SceneMetadata {
     uint32_t numEpisodes;
     string meshPath;
     string navPath;
+};
+
+template <typename T>
+class DynArray {
+public:
+    explicit DynArray(size_t n)
+        : ptr_(allocator<T>().allocate(n)),
+          n_(n)
+    {}
+
+    ~DynArray()
+    {
+        for (size_t i = 0; i < n_; i++) {
+            ptr_[i].~T();
+        }
+        allocator<T>().deallocate(ptr_, n_);
+    }
+
+    T &operator[](size_t idx) { return ptr_[idx]; }
+    const T &operator[](size_t idx) const { return ptr_[idx]; }
+
+    T *begin() { return ptr_; }
+    T *end() { return ptr_ + n_; }
+    const T *begin() const { return ptr_; }
+    const T *end() const { return ptr_ + n_; }
+
+private:
+    T *ptr_;
+    size_t n_;
 };
 
 static simdjson::dom::element parseFile(const string &file_path,
@@ -292,7 +320,7 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
     if (doubleBuffered) {
         options |= RenderOptions::DoubleBuffered;
     }
-    // options |= RenderOptions::CpuSynchronization;
+    //options |= RenderOptions::CpuSynchronization;
 
     auto make = [&](auto features) {
         return BatchRendererCUDA(
@@ -665,6 +693,96 @@ private:
     friend class EnvironmentGroup;
 };
 
+static uint32_t computeNumWorkers(int num_desired_workers)
+{
+    assert(num_desired_workers != 0);
+    return num_desired_workers == -1 ?
+               max(static_cast<int64_t>(thread::hardware_concurrency()) - 1,
+                   1l) :
+               num_desired_workers;
+}
+
+class SceneSwapper {
+public:
+    SceneSwapper(AssetLoader &&loader,
+                 Dataset &dataset,
+                 uint32_t &active_scene,
+                 std::vector<uint32_t> &inactive_scenes,
+                 uint32_t envs_per_scene,
+                 mt19937 &rgen)
+        : loader_ {std::move(loader)},
+          dataset_ {dataset},
+          active_scene_ {active_scene},
+          inactive_scenes_ {inactive_scenes},
+          envs_per_scene_ {envs_per_scene},
+          rgen_ {rgen},
+          num_scene_loads_ {0},
+          next_scene_future_ {},
+          next_scene_ {}
+    {}
+
+    SceneSwapper() = delete;
+    SceneSwapper(const SceneSwapper &) = delete;
+
+    bool canSwapScene() const
+    {
+        return next_scene_ == nullptr && !next_scene_future_.valid();
+    }
+
+    void startSceneSwap()
+    {
+        assert(canSwapScene());
+        uniform_int_distribution<uint32_t> scene_selector(
+            0, inactive_scenes_.size() - 1);
+
+        uint32_t new_scene_position = scene_selector(rgen_);
+
+        swap(inactive_scenes_[new_scene_position], active_scene_);
+
+        auto scene_path = dataset_.getScenePath(active_scene_);
+
+        next_scene_future_ = loader_.asyncLoadScene(scene_path);
+    }
+
+    void preStep()
+    {
+        if (next_scene_future_.valid() && isReady(next_scene_future_)) {
+            next_scene_ = next_scene_future_.get();
+            num_scene_loads_.store(envs_per_scene_, memory_order_relaxed);
+        }
+    }
+
+    void postStep()
+    {
+        if (next_scene_ != nullptr &&
+            num_scene_loads_.load(memory_order_relaxed) == 0) {
+            next_scene_ = nullptr;
+            startSceneSwap();
+        }
+    }
+
+    void oneLoaded() { num_scene_loads_.fetch_sub(1, memory_order_relaxed); }
+
+    BackgroundSceneLoader &getLoader() { return loader_; }
+    const shared_ptr<Scene> &getNextScene() const { return next_scene_; }
+    atomic_uint32_t &getNumSceneLoads() { return num_scene_loads_; }
+
+
+private:
+    BackgroundSceneLoader loader_;
+    Dataset &dataset_;
+
+    uint32_t &active_scene_;
+    vector<uint32_t> &inactive_scenes_;
+    uint32_t envs_per_scene_;
+
+    mt19937 &rgen_;
+
+    atomic_uint32_t num_scene_loads_;
+    future<shared_ptr<Scene>> next_scene_future_;
+    shared_ptr<Scene> next_scene_;
+};
+
 class EnvironmentGroup {
 public:
     EnvironmentGroup(CommandStreamCUDA &strm,
@@ -672,7 +790,8 @@ public:
                      const Dataset &dataset,
                      mt19937 &rgen,
                      uint32_t envs_per_scene,
-                     const Span<uint32_t> &initial_scene_indices)
+                     const Span<const uint32_t> &initial_scene_indices,
+                     const Span<SceneSwapper> &scene_swappers)
         : cmd_strm_(strm),
           dataset_(dataset),
           render_envs_(),
@@ -689,7 +808,10 @@ public:
 
         // Take address of scene_idx so all envs can know when
         // the corresponding active scene is updated by a swap
-        for (const uint32_t &scene_idx : initial_scene_indices) {
+        for (uint32_t i = 0; i < initial_scene_indices.size(); i++) {
+            const uint32_t &scene_idx = initial_scene_indices[i];
+            SceneSwapper &scene_swapper = scene_swappers[i];
+
             auto scene_path = dataset_.getScenePath(scene_idx);
             auto scene = loader.loadScene(scene_path);
 
@@ -701,7 +823,7 @@ public:
                 sim_states_.emplace_back(scene_episodes, render_envs_.back(),
                                          getPointers(sim_states_.size()),
                                          rgen);
-                env_scenes_.emplace_back(&scene_idx);
+                env_scenes_.emplace_back(&scene_idx, &scene_swapper);
             }
         }
     }
@@ -747,18 +869,20 @@ public:
     bool swapReady(const ThreadEnvironment &env) const
     {
         const auto &scene_tracker = env_scenes_[env.idx_];
-        return !scene_tracker.isConsistent();
+        return scene_tracker.getSwapper().getNextScene() != nullptr && !scene_tracker.isConsistent();
     }
 
     void swapScene(ThreadEnvironment &env,
-                   const shared_ptr<Scene> &scene_data,
                    vector<esp::nav::PathFinder> &pathfinders,
                    std::mt19937 &rgen)
     {
-        render_envs_[env.idx_] =
-            cmd_strm_.makeEnvironment(scene_data, 90, 0.01, 1000);
-
         auto &scene_tracker = env_scenes_[env.idx_];
+        SceneSwapper &swapper = scene_tracker.getSwapper();
+        shared_ptr<Scene> scene_data = swapper.getNextScene();
+
+        render_envs_[env.idx_] =
+            cmd_strm_.makeEnvironment(move(scene_data), 90, 0.01, 1000);
+
         scene_tracker.update();
         uint32_t scene_idx = scene_tracker.curScene();
 
@@ -769,14 +893,17 @@ public:
                       getPointers(env.idx_), rgen);
 
         env.pathfinder_ = &pathfinders[env_scenes_[env.idx_].curScene()];
+
+        swapper.oneLoaded();
     }
 
 private:
     class SceneTracker {
     public:
-        SceneTracker(const uint32_t *src_ptr)
+        SceneTracker(const uint32_t *src_ptr, SceneSwapper *swapper)
             : src_ptr_(src_ptr),
-              cur_(*src_ptr_)
+              cur_(*src_ptr_),
+              swapper_(swapper)
         {}
 
         bool isConsistent() const { return *src_ptr_ == cur_; }
@@ -785,9 +912,14 @@ private:
 
         uint32_t curScene() const { return cur_; }
 
+        SceneSwapper &getSwapper() { return *swapper_; }
+        const SceneSwapper &getSwapper() const { return *swapper_; }
+
     private:
         const uint32_t *src_ptr_;
         uint32_t cur_;
+
+        SceneSwapper *swapper_;
     };
 
     ResultPointers getPointers(uint32_t idx)
@@ -809,96 +941,6 @@ private:
     vector<float> masks_;
     vector<StepInfo> infos_;
     vector<glm::vec2> polars_;
-};
-
-static uint32_t computeNumWorkers(int num_desired_workers)
-{
-    assert(num_desired_workers != 0);
-    return num_desired_workers == -1 ?
-               max(static_cast<int64_t>(thread::hardware_concurrency()) - 1,
-                   1l) :
-               num_desired_workers;
-}
-
-class SceneSwapper {
-public:
-    SceneSwapper(AssetLoader &&loader,
-                 Dataset &dataset,
-                 uint32_t &active_scene,
-                 std::vector<uint32_t> &inactive_scenes,
-                 uint32_t envs_per_scene,
-                 mt19937 &rgen)
-        : loader_ {std::move(loader)},
-          dataset_ {dataset},
-          active_scene_ {active_scene},
-          inactive_scenes_ {inactive_scenes},
-          envs_per_scene_ {envs_per_scene},
-          rgen_ {rgen},
-          num_scene_loads_ {0},
-          next_scene_future_ {},
-          next_scene_ {}
-    {}
-
-    SceneSwapper() = delete;
-    SceneSwapper(const SceneSwapper &) = delete;
-    SceneSwapper(SceneSwapper &&) = default;
-
-    bool canSwapScene() const
-    {
-        return next_scene_ == nullptr && !next_scene_future_.valid();
-    }
-
-    void startSceneSwap()
-    {
-        assert(canSwapScene());
-        uniform_int_distribution<uint32_t> scene_selector(
-            0, inactive_scenes_.size() - 1);
-
-        uint32_t new_scene_position = scene_selector(rgen_);
-
-        swap(inactive_scenes_[new_scene_position], active_scene_);
-
-        auto scene_path = dataset_.getScenePath(active_scene_);
-
-        next_scene_future_ = loader_.asyncLoadScene(scene_path);
-    }
-
-    void preStep()
-    {
-        if (next_scene_future_.valid() && isReady(next_scene_future_)) {
-            next_scene_ = next_scene_future_.get();
-            num_scene_loads_.store(envs_per_scene_, memory_order_relaxed);
-        }
-    }
-
-    void postStep()
-    {
-        if (next_scene_ != nullptr &&
-            num_scene_loads_.load(memory_order_relaxed) == 0) {
-            next_scene_ = nullptr;
-            startSceneSwap();
-        }
-    }
-
-    void oneLoaded() { num_scene_loads_.fetch_sub(1, memory_order_relaxed); }
-
-    BackgroundSceneLoader &getLoader() { return loader_; }
-    const shared_ptr<Scene> &getNextScene() { return next_scene_; }
-    atomic_uint32_t &getNumSceneLoads() { return num_scene_loads_; }
-
-private:
-    BackgroundSceneLoader loader_;
-    Dataset &dataset_;
-
-    uint32_t &active_scene_;
-    vector<uint32_t> &inactive_scenes_;
-    uint32_t envs_per_scene_;
-
-    mt19937 &rgen_;
-
-    atomic_uint32_t num_scene_loads_;
-    future<shared_ptr<Scene>> next_scene_future_;
-    shared_ptr<Scene> next_scene_;
 };
 
 class RolloutGenerator {
@@ -949,13 +991,13 @@ public:
     void step(uint32_t group_idx,
               const py::array_t<int64_t, py::array::c_style> &actions)
     {
-        for (auto &swapper : scene_swappers_) swapper->preStep();
+        for (auto &swapper : scene_swappers_) swapper.preStep();
 
         auto action_raw = actions.unchecked<1>();
 
         simulateAndRender(group_idx, false, action_raw.data(0));
 
-        for (auto &swapper : scene_swappers_) swapper->postStep();
+        for (auto &swapper : scene_swappers_) swapper.postStep();
     }
 
     py::array_t<float> getRewards(uint32_t group_idx) const
@@ -1024,6 +1066,7 @@ private:
           inactive_scenes_(),
           rgen_(seed),
           groups_(),
+          scene_swappers_(num_active_scenes),
           worker_threads_(),
           start_barrier_(),
           finish_barrier_(),
@@ -1062,29 +1105,30 @@ private:
         assert(num_environments % num_active_scenes == 0);
         assert(num_active_scenes % num_groups == 0);
 
-        scene_swappers_.reserve(num_active_scenes);
-        for (uint32_t i = 0; i < num_active_scenes; ++i)
-            scene_swappers_.emplace_back(new SceneSwapper {
+        for (uint32_t i = 0; i < num_active_scenes; ++i) {
+            new (&scene_swappers_[i]) SceneSwapper(
                 renderer_.makeLoader(), dataset_, active_scenes_[i],
-                inactive_scenes_, envs_per_scene_, rgen_});
+                inactive_scenes_, envs_per_scene_, rgen_);
+        }
 
-        envs_per_group_ = num_environments / num_groups;
+        uint32_t envs_per_group = num_environments / num_groups;
         uint32_t scenes_per_group = num_active_scenes / num_groups;
 
         for (uint32_t i = 0; i < num_groups; i++) {
             groups_.emplace_back(
-                cmd_strm_, scene_swappers_.front()->getLoader(), dataset_,
+                cmd_strm_, scene_swappers_[0].getLoader(), dataset_,
                 rgen_, envs_per_scene_,
-                Span(&active_scenes_[i * scenes_per_group], scenes_per_group));
+                Span<const uint32_t>(&active_scenes_[i * scenes_per_group], scenes_per_group),
+                Span(&scene_swappers_[i * scenes_per_group], scenes_per_group));
         }
 
-        for (auto &swapper : scene_swappers_) swapper->startSceneSwap();
+        for (auto &swapper : scene_swappers_) swapper.startSceneSwap();
 
         pthread_barrier_init(&start_barrier_, nullptr, num_workers + 1);
         pthread_barrier_init(&finish_barrier_, nullptr, num_workers + 1);
 
-        uint32_t envs_per_thread = envs_per_group_ / num_workers;
-        uint32_t extra_files = envs_per_group_ - envs_per_thread * num_workers;
+        uint32_t envs_per_thread = envs_per_group / num_workers;
+        uint32_t extra_files = envs_per_group - envs_per_thread * num_workers;
 
         uint32_t thread_env_offset = 0;
         for (uint32_t thread_idx = 0; thread_idx < num_workers; thread_idx++) {
@@ -1186,18 +1230,8 @@ private:
                     bool done = group.step(env, thread_actions[idx]);
 
                     if (done) {
-                        uint32_t global_env_idx =
-                            active_group_ * envs_per_group_ + begin_env_idx +
-                            idx;
-                        uint32_t scene_group_idx =
-                            global_env_idx / envs_per_scene_;
-
-                        const auto &next_scene =
-                            scene_swappers_[scene_group_idx]->getNextScene();
-                        if (next_scene != nullptr && group.swapReady(env)) {
-                            group.swapScene(env, next_scene,
-                                            thread_pathfinders, rgen);
-                            scene_swappers_[scene_group_idx]->oneLoaded();
+                        if (group.swapReady(env)) {
+                            group.swapScene(env, thread_pathfinders, rgen);
                         }
 
                         group.reset(env);
@@ -1213,13 +1247,12 @@ private:
     BatchRendererCUDA renderer_;
     CommandStreamCUDA cmd_strm_;
     uint32_t envs_per_scene_;
-    uint32_t envs_per_group_;
     vector<uint32_t> active_scenes_;
     vector<uint32_t> inactive_scenes_;
 
     mt19937 rgen_;
     vector<EnvironmentGroup> groups_;
-    vector<unique_ptr<SceneSwapper>> scene_swappers_;
+    DynArray<SceneSwapper> scene_swappers_;
 
     vector<thread> worker_threads_;
     pthread_barrier_t start_barrier_;
