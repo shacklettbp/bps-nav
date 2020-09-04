@@ -393,9 +393,7 @@ private:
                 loader_requests_.pop();
             }
 
-            std::cout << "Loading scene" << std::endl;
             auto scene = loader_.loadScene(scene_path);
-            std::cout << "Loaded scene" << std::endl;
             loader_promise.set_value(move(scene));
         }
     };
@@ -867,30 +865,22 @@ public:
 
     void preStep()
     {
-        std::cout << "Pre enter" << std::endl;
         if (next_scene_future_.valid() && isReady(next_scene_future_)) {
             next_scene_ = next_scene_future_.get();
             num_scene_loads_.store(envs_per_scene_, memory_order_relaxed);
         }
-        std::cout << "Pre exit" << std::endl;
     }
 
     void postStep()
     {
-        std::cout << "Post enter" << std::endl;
         if (next_scene_ != nullptr &&
             num_scene_loads_.load(memory_order_relaxed) == 0) {
             next_scene_ = nullptr;
             startSceneSwap();
         }
-        std::cout << "Post exit" << std::endl;
     }
 
-    void oneLoaded()
-    {
-        num_scene_loads_.fetch_sub(1, memory_order_relaxed);
-        std::cout << num_scene_loads_.load() << std::endl;
-    }
+    void oneLoaded() { num_scene_loads_.fetch_sub(1, memory_order_relaxed); }
 
     BackgroundSceneLoader &getLoader() { return loader_; }
     const shared_ptr<Scene> &getNextScene() { return next_scene_; }
@@ -1199,14 +1189,12 @@ private:
                         uint32_t global_env_idx =
                             active_group_ * envs_per_group_ + begin_env_idx +
                             idx;
-
                         uint32_t scene_group_idx =
                             global_env_idx / envs_per_scene_;
 
                         const auto &next_scene =
                             scene_swappers_[scene_group_idx]->getNextScene();
                         if (next_scene != nullptr && group.swapReady(env)) {
-                            std::cout << "Swapping" << std::endl;
                             group.swapScene(env, next_scene,
                                             thread_pathfinders, rgen);
                             scene_swappers_[scene_group_idx]->oneLoaded();
@@ -1215,9 +1203,9 @@ private:
                         group.reset(env);
                     }
                 }
-
-                pthread_barrier_wait(&finish_barrier_);
             }
+
+            pthread_barrier_wait(&finish_barrier_);
         }
     }
 
