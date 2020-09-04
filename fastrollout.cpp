@@ -867,7 +867,6 @@ public:
 
     void preStep()
     {
-        if (canSwapScene()) startSceneSwap();
         std::cout << "Pre enter" << std::endl;
         if (next_scene_future_.valid() && isReady(next_scene_future_)) {
             next_scene_ = next_scene_future_.get();
@@ -882,6 +881,7 @@ public:
         if (next_scene_ != nullptr &&
             num_scene_loads_.load(memory_order_relaxed) == 0) {
             next_scene_ = nullptr;
+            startSceneSwap();
         }
         std::cout << "Post exit" << std::endl;
     }
