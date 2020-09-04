@@ -82,10 +82,7 @@ struct SceneMetadata {
 template <typename T>
 class DynArray {
 public:
-    explicit DynArray(size_t n)
-        : ptr_(allocator<T>().allocate(n)),
-          n_(n)
-    {}
+    explicit DynArray(size_t n) : ptr_(allocator<T>().allocate(n)), n_(n) {}
 
     ~DynArray()
     {
@@ -320,7 +317,7 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
     if (doubleBuffered) {
         options |= RenderOptions::DoubleBuffered;
     }
-    //options |= RenderOptions::CpuSynchronization;
+    // options |= RenderOptions::CpuSynchronization;
 
     auto make = [&](auto features) {
         return BatchRendererCUDA(
@@ -767,7 +764,6 @@ public:
     const shared_ptr<Scene> &getNextScene() const { return next_scene_; }
     atomic_uint32_t &getNumSceneLoads() { return num_scene_loads_; }
 
-
 private:
     BackgroundSceneLoader loader_;
     Dataset &dataset_;
@@ -869,7 +865,8 @@ public:
     bool swapReady(const ThreadEnvironment &env) const
     {
         const auto &scene_tracker = env_scenes_[env.idx_];
-        return scene_tracker.getSwapper().getNextScene() != nullptr && !scene_tracker.isConsistent();
+        return scene_tracker.getSwapper().getNextScene() != nullptr &&
+               !scene_tracker.isConsistent();
     }
 
     void swapScene(ThreadEnvironment &env,
@@ -1116,10 +1113,12 @@ private:
 
         for (uint32_t i = 0; i < num_groups; i++) {
             groups_.emplace_back(
-                cmd_strm_, scene_swappers_[0].getLoader(), dataset_,
-                rgen_, envs_per_scene_,
-                Span<const uint32_t>(&active_scenes_[i * scenes_per_group], scenes_per_group),
-                Span(&scene_swappers_[i * scenes_per_group], scenes_per_group));
+                cmd_strm_, scene_swappers_[0].getLoader(), dataset_, rgen_,
+                envs_per_scene_,
+                Span<const uint32_t>(&active_scenes_[i * scenes_per_group],
+                                     scenes_per_group),
+                Span(&scene_swappers_[i * scenes_per_group],
+                     scenes_per_group));
         }
 
         for (auto &swapper : scene_swappers_) swapper.startSceneSwap();
