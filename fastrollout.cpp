@@ -886,10 +886,14 @@ public:
         std::cout << "Post exit" << std::endl;
     }
 
-    void oneLoaded() { num_scene_loads_.fetch_sub(1, memory_order_relaxed); }
+    void oneLoaded()
+    {
+        num_scene_loads_.fetch_sub(1, memory_order_relaxed);
+        std::cout << num_scene_loads_.load() << std::endl;
+    }
 
     BackgroundSceneLoader &getLoader() { return loader_; }
-    shared_ptr<Scene> getNextScene() { return next_scene_; }
+    const shared_ptr<Scene> &getNextScene() { return next_scene_; }
     atomic_uint32_t &getNumSceneLoads() { return num_scene_loads_; }
 
 private:
@@ -1199,9 +1203,10 @@ private:
                         uint32_t scene_group_idx =
                             global_env_idx / envs_per_scene_;
 
-                        auto next_scene =
+                        const auto &next_scene =
                             scene_swappers_[scene_group_idx]->getNextScene();
                         if (next_scene != nullptr && group.swapReady(env)) {
+                            std::cout << "Swapping" << std::endl;
                             group.swapScene(env, next_scene,
                                             thread_pathfinders, rgen);
                             scene_swappers_[scene_group_idx]->oneLoaded();
