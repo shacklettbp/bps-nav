@@ -82,10 +82,7 @@ struct SceneMetadata {
 template <typename T>
 class DynArray {
 public:
-    explicit DynArray(size_t n)
-        : ptr_(allocator<T>().allocate(n)),
-          n_(n)
-    {}
+    explicit DynArray(size_t n) : ptr_(allocator<T>().allocate(n)), n_(n) {}
 
     ~DynArray()
     {
@@ -320,7 +317,7 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
     if (doubleBuffered) {
         options |= RenderOptions::DoubleBuffered;
     }
-    //options |= RenderOptions::CpuSynchronization;
+    // options |= RenderOptions::CpuSynchronization;
 
     auto make = [&](auto features) {
         return BatchRendererCUDA(
@@ -443,7 +440,7 @@ struct StepInfo {
 
 struct ResultPointers {
     float *reward;
-    float *mask;
+    uint8_t *mask;
     StepInfo *info;
     glm::vec2 *polar;
 };
@@ -532,10 +529,7 @@ public:
                 float(distance_to_goal < SimulatorConfig::SUCCESS_DISTANCE);
             spl = success * initial_distance_to_goal_ /
                   max(initial_distance_to_goal_, cumulative_travel_distance_),
-            reward += SimulatorConfig::SUCCESS_REWARD * spl *
-                      (0.5 + max(1.0 - distance_to_goal /
-                                           SimulatorConfig::SUCCESS_DISTANCE,
-                                 0.5));
+            reward += SimulatorConfig::SUCCESS_REWARD * spl;
         } else {
             glm::vec3 prev_position = position_;
 
@@ -563,11 +557,7 @@ public:
         };
 
         *outputs_.reward = reward;
-        if (done) {
-            *outputs_.mask = 0.f;
-        } else {
-            *outputs_.mask = 1.f;
-        }
+        *outputs_.mask = done ? 0 : 1;
         *outputs_.info = info;
 
         return done;
@@ -767,7 +757,6 @@ public:
     const shared_ptr<Scene> &getNextScene() const { return next_scene_; }
     atomic_uint32_t &getNumSceneLoads() { return num_scene_loads_; }
 
-
 private:
     BackgroundSceneLoader loader_;
     Dataset &dataset_;
@@ -835,7 +824,10 @@ public:
         return makeFlatNumpyArray(rewards_);
     }
 
-    py::array_t<float> getMasks() const { return makeFlatNumpyArray(masks_); }
+    py::array_t<uint8_t> getMasks() const
+    {
+        return makeFlatNumpyArray(masks_);
+    }
 
     py::array_t<StepInfo> getInfos() const
     {
@@ -869,7 +861,8 @@ public:
     bool swapReady(const ThreadEnvironment &env) const
     {
         const auto &scene_tracker = env_scenes_[env.idx_];
-        return scene_tracker.getSwapper().getNextScene() != nullptr && !scene_tracker.isConsistent();
+        return scene_tracker.getSwapper().getNextScene() != nullptr &&
+               !scene_tracker.isConsistent();
     }
 
     void swapScene(ThreadEnvironment &env,
@@ -938,7 +931,7 @@ private:
     vector<Simulator> sim_states_;
     vector<SceneTracker> env_scenes_;
     vector<float> rewards_;
-    vector<float> masks_;
+    vector<uint8_t> masks_;
     vector<StepInfo> infos_;
     vector<glm::vec2> polars_;
 };
@@ -1005,7 +998,7 @@ public:
         return groups_[group_idx].getRewards();
     }
 
-    py::array_t<float> getMasks(uint32_t group_idx) const
+    py::array_t<uint8_t> getMasks(uint32_t group_idx) const
     {
         return groups_[group_idx].getMasks();
     }
@@ -1116,10 +1109,12 @@ private:
 
         for (uint32_t i = 0; i < num_groups; i++) {
             groups_.emplace_back(
-                cmd_strm_, scene_swappers_[0].getLoader(), dataset_,
-                rgen_, envs_per_scene_,
-                Span<const uint32_t>(&active_scenes_[i * scenes_per_group], scenes_per_group),
-                Span(&scene_swappers_[i * scenes_per_group], scenes_per_group));
+                cmd_strm_, scene_swappers_[0].getLoader(), dataset_, rgen_,
+                envs_per_scene_,
+                Span<const uint32_t>(&active_scenes_[i * scenes_per_group],
+                                     scenes_per_group),
+                Span(&scene_swappers_[i * scenes_per_group],
+                     scenes_per_group));
         }
 
         for (auto &swapper : scene_swappers_) swapper.startSceneSwap();
