@@ -44,6 +44,28 @@ at::Tensor convertToTensorDepth(const py::capsule &ptr_capsule,
     return torch::from_blob(dev_ptr, sizes, options);
 }
 
+// TensorRT helpers
+at::Tensor convertToTensorFCOut(const py::capsule &ptr_capsule,
+                                int dev_id,
+                                uint32_t batch_size,
+                                uint32_t num_features)
+{ 
+    __half *dev_ptr(ptr_capsule);
+
+    array<int64_t, 2> sizes {{batch_size, num_features}};
+
+    auto options = torch::TensorOptions()
+                       .dtype(torch::kFloat16)
+                       .device(torch::kCUDA, (short)dev_id);
+
+    return torch::from_blob(dev_ptr, sizes, options);
+}
+
+py::capsule tensorToCapsule(const at::Tensor &tensor)
+{
+    return py::capsule(tensor.data_ptr());
+}
+
 class PyTorchSync {
 public:
     PyTorchSync(const py::capsule &cap) : sema_(cudaExternalSemaphore_t(cap))
@@ -75,4 +97,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("wait", &PyTorchSync::wait);
     m.def("make_color_tensor", &convertToTensorColor);
     m.def("make_depth_tensor", &convertToTensorDepth);
+    m.def("make_fcout_tensor", &convertToTensorFCOut);
+    m.def("tensor_to_capsule", &tensorToCapsule);
 }
