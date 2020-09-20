@@ -1058,8 +1058,8 @@ private:
           active_scenes_(),
           inactive_scenes_(),
           rgen_(seed),
-          groups_(),
           scene_swappers_(num_active_scenes),
+          groups_(),
           worker_threads_(),
           start_barrier_(),
           finish_barrier_(),
@@ -1246,8 +1246,8 @@ private:
     vector<uint32_t> inactive_scenes_;
 
     mt19937 rgen_;
-    vector<EnvironmentGroup> groups_;
     DynArray<SceneSwapper> scene_swappers_;
+    vector<EnvironmentGroup> groups_;
 
     vector<thread> worker_threads_;
     pthread_barrier_t start_barrier_;
