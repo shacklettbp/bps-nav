@@ -24,6 +24,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <pthread.h>
 
 using namespace std;
 using namespace v4r;
@@ -400,6 +401,8 @@ struct BackgroundSceneLoader {
 private:
     void loaderLoop()
     {
+        nice(19);
+
         while (true) {
             string scene_path;
             promise<shared_ptr<Scene>> loader_promise;
@@ -1134,10 +1137,11 @@ private:
             }
 
             worker_threads_.emplace_back([this, thread_env_offset,
-                                          thread_num_envs, num_groups,
-                                          seed]() {
+                                          thread_num_envs, num_groups, seed,
+                                          thread_idx]() {
                 simulationWorker(thread_env_offset, thread_num_envs,
-                                 num_groups, seed + thread_env_offset);
+                                 num_groups, seed + thread_env_offset,
+                                 thread_idx);
             });
 
             thread_env_offset += thread_num_envs;
@@ -1170,8 +1174,38 @@ private:
     void simulationWorker(uint32_t begin_env_idx,
                           uint32_t num_envs,
                           uint32_t num_groups,
-                          uint64_t seed)
+                          uint64_t seed,
+                          uint64_t rank)
     {
+        {
+            cpu_set_t cpuset;
+            pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+            const uint32_t num_cores = CPU_COUNT(&cpuset);
+
+            cpu_set_t worker_set;
+            CPU_ZERO(&worker_set);
+
+            // This is needed incase there was already cpu masking via
+            // a different call to setaffinity or via cgroup (SLURM)
+            const uint32_t worker_cpu_idx = rank % num_cores;
+            for (uint32_t cpu_idx = 0, cpus_found = 0; cpu_idx < CPU_SETSIZE;
+                 ++cpu_idx) {
+                if (CPU_ISSET(cpu_idx, &cpuset)) {
+                    if (cpus_found == worker_cpu_idx) {
+                        CPU_SET(cpu_idx, &worker_set);
+                        break;
+                    } else {
+                        ++cpus_found;
+                    }
+                }
+            }
+
+            assert(cpus_found == worker_cpu_idx);
+
+            pthread_setaffinity_np(pthread_self(), sizeof(worker_set),
+                                   &worker_set);
+        }
+
         uint32_t end_env_idx = begin_env_idx + num_envs;
         mt19937 rgen(seed);
 
