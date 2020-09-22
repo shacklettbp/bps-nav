@@ -349,11 +349,76 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
     }
 }
 
-template <typename R>
-static bool isReady(const future<R> &f)
-{
-    return f.wait_for(chrono::seconds(0)) == future_status::ready;
-}
+template <typename T>
+struct FastPromise {
+    FastPromise() : value_ {nullptr}, status_ {nullptr} {}
+
+    explicit FastPromise(T *value, atomic_uint32_t *status)
+        : value_ {value},
+          status_ {status}
+    {}
+
+    void set_result(T &&v)
+    {
+        *value_ = v;
+        status_->store(1, memory_order_release);
+    }
+
+private:
+    T *value_;
+    atomic_uint32_t *status_;
+};
+
+template <typename T>
+struct FastFuture {
+    FastFuture() : value_ {new T}, status_ {new atomic_uint32_t}
+    {
+        status_->store(0, memory_order_relaxed);
+    }
+
+    FastFuture(FastFuture &&f) : value_ {nullptr}, status_ {nullptr}
+    {
+        std::swap(value_, f.value_);
+        std::swap(status_, f.status_);
+    }
+
+    FastFuture &operator=(FastFuture &&f)
+    {
+        delete value_;
+        delete status_;
+        value_ = nullptr;
+        status_ = nullptr;
+
+        std::swap(value_, f.value_);
+        std::swap(status_, f.status_);
+        return *this;
+    }
+
+    bool valid() const { return status_->load(memory_order_relaxed) != 2; }
+    bool isReady() const { return status_->load(memory_order_relaxed) == 1; }
+
+    T get()
+    {
+        atomic_thread_fence(memory_order_acquire);
+        status_->store(2, memory_order_relaxed);
+        return move(*value_);
+    }
+
+    FastFuture(FastFuture &) = delete;
+    FastFuture &operator=(FastFuture &) = delete;
+
+    ~FastFuture()
+    {
+        delete value_;
+        delete status_;
+    }
+
+    FastPromise<T> promise() { return FastPromise<T> {value_, status_}; }
+
+private:
+    T *value_;
+    atomic_uint32_t *status_;
+};
 
 struct BackgroundSceneLoader {
     explicit BackgroundSceneLoader(AssetLoader &&loader)
@@ -376,22 +441,17 @@ struct BackgroundSceneLoader {
 
     shared_ptr<Scene> loadScene(string_view scene_path)
     {
-        auto fut = asyncLoadScene(scene_path);
-        fut.wait();
-        return fut.get();
+        return loader_.loadScene(scene_path);
     }
 
-    future<shared_ptr<Scene>> asyncLoadScene(string_view scene_path)
+    FastFuture<shared_ptr<Scene>> asyncLoadScene(string_view scene_path)
     {
-        future<shared_ptr<Scene>> loader_future;
+        FastFuture<shared_ptr<Scene>> loader_future;
 
         {
             lock_guard<mutex> wait_lock(loader_mutex_);
 
-            promise<shared_ptr<Scene>> loader_promise;
-            loader_future = loader_promise.get_future();
-
-            loader_requests_.emplace(scene_path, move(loader_promise));
+            loader_requests_.emplace(scene_path, loader_future.promise());
         }
         loader_cv_.notify_one();
 
@@ -405,7 +465,7 @@ private:
 
         while (true) {
             string scene_path;
-            promise<shared_ptr<Scene>> loader_promise;
+            FastPromise<shared_ptr<Scene>> loader_promise;
             {
                 unique_lock<mutex> wait_lock(loader_mutex_);
                 while (loader_requests_.size() == 0) {
@@ -422,7 +482,7 @@ private:
             }
 
             auto scene = loader_.loadScene(scene_path);
-            loader_promise.set_value(move(scene));
+            loader_promise.set_result(move(scene));
         }
     };
 
@@ -431,7 +491,7 @@ private:
     mutex loader_mutex_;
     condition_variable loader_cv_;
     bool loader_exit_;
-    queue<pair<string, promise<shared_ptr<Scene>>>> loader_requests_;
+    queue<pair<string, FastPromise<shared_ptr<Scene>>>> loader_requests_;
     thread loader_thread_;
 };
 
@@ -468,8 +528,6 @@ public:
               ResultPointers ptrs,
               mt19937 &rgen)
         : episodes_(episodes),
-          cur_episode_(0),
-          episode_order_(),
           render_env_(&render_env),
           outputs_(ptrs),
           position_(),
@@ -480,21 +538,17 @@ public:
           initial_distance_to_goal_(),
           prev_distance_to_goal_(),
           cumulative_travel_distance_(),
-          step_()
-    {
-        episode_order_.reserve(episodes_.size());
-        for (uint32_t i = 0; i < episodes_.size(); i++) {
-            episode_order_.push_back(i);
-        }
-
-        shuffle(episode_order_.begin(), episode_order_.end(), rgen);
-    }
+          step_(),
+          rgen_(rgen())
+    {}
 
     void reset(esp::nav::PathFinder &pathfinder)
     {
         step_ = 1;
 
-        const Episode &episode = episodes_[episode_order_[cur_episode_]];
+        std::uniform_int_distribution<uint64_t> episode_dist(
+            0, episodes_.size() - 1);
+        const Episode &episode = episodes_[episode_dist(rgen_)];
         position_ = episode.startPosition;
         rotation_ = episode.startRotation;
         goal_ = episode.goal;
@@ -509,8 +563,6 @@ public:
         prev_distance_to_goal_ = initial_distance_to_goal_;
 
         updateObservationState();
-
-        cur_episode_++;
     }
 
     bool step(int64_t raw_action, esp::nav::PathFinder &pathfinder)
@@ -636,8 +688,6 @@ private:
     }
 
     Span<const Episode> episodes_;
-    uint32_t cur_episode_;
-    vector<uint32_t> episode_order_;
     Environment *render_env_;
     ResultPointers outputs_;
 
@@ -652,6 +702,8 @@ private:
     float prev_distance_to_goal_;
     float cumulative_travel_distance_;
     uint32_t step_;
+
+    std::mt19937 rgen_;
 };
 
 template <typename T>
@@ -739,7 +791,7 @@ public:
 
     void preStep()
     {
-        if (next_scene_future_.valid() && isReady(next_scene_future_)) {
+        if (next_scene_future_.isReady()) {
             next_scene_ = next_scene_future_.get();
             num_scene_loads_.store(envs_per_scene_, memory_order_relaxed);
         }
@@ -771,7 +823,7 @@ private:
     mt19937 &rgen_;
 
     atomic_uint32_t num_scene_loads_;
-    future<shared_ptr<Scene>> next_scene_future_;
+    FastFuture<shared_ptr<Scene>> next_scene_future_;
     shared_ptr<Scene> next_scene_;
 };
 
@@ -1179,7 +1231,7 @@ private:
     {
         {
             cpu_set_t cpuset;
-            pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+            pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
             const uint32_t num_cores = CPU_COUNT(&cpuset);
 
             cpu_set_t worker_set;
