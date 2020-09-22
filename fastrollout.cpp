@@ -1200,8 +1200,6 @@ private:
                 }
             }
 
-            assert(cpus_found == worker_cpu_idx);
-
             pthread_setaffinity_np(pthread_self(), sizeof(worker_set),
                                    &worker_set);
         }
