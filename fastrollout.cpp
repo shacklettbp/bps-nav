@@ -246,6 +246,9 @@ public:
                             abort();
                         }
 
+                        string bps_suffix =
+                            string(scene_id.substr(0, dotpos)) + ".bps";
+
                         // FIXME is there some more principled way to get this?
                         string navmesh_suffix =
                             string(scene_id.substr(0, dotpos)) + ".navmesh";
@@ -254,7 +257,7 @@ public:
                             scene_episode_start,
                             static_cast<uint32_t>(episodes.size() -
                                                   scene_episode_start),
-                            asset_path_name + "/" + string(scene_id),
+                            asset_path_name + "/" + bps_suffix,
                             asset_path_name + "/" + navmesh_suffix,
                         });
                     }
