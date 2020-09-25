@@ -424,8 +424,8 @@ private:
 };
 
 struct BackgroundSceneLoader {
-    explicit BackgroundSceneLoader(AssetLoader &&loader)
-        : loader_ {move(loader)},
+    explicit BackgroundSceneLoader(AssetLoader &loader)
+        : loader_ {loader},
           loader_mutex_ {},
           loader_cv_ {},
           loader_exit_ {false},
@@ -489,8 +489,7 @@ private:
         }
     };
 
-    AssetLoader loader_;
-
+    AssetLoader &loader_;
     mutex loader_mutex_;
     condition_variable loader_cv_;
     bool loader_exit_;
@@ -758,15 +757,16 @@ public:
                  std::vector<uint32_t> &inactive_scenes,
                  uint32_t envs_per_scene,
                  mt19937 &rgen)
-        : loader_ {std::move(loader)},
+        : renderer_loader_ {move(loader)},
+          num_scene_loads_ {0},
+          next_scene_future_ {},
+          next_scene_ {},
+          loader_ {renderer_loader_},
           dataset_ {dataset},
           active_scene_ {active_scene},
           inactive_scenes_ {inactive_scenes},
           envs_per_scene_ {envs_per_scene},
-          rgen_ {rgen},
-          num_scene_loads_ {0},
-          next_scene_future_ {},
-          next_scene_ {}
+          rgen_ {rgen}
     {}
 
     SceneSwapper() = delete;
@@ -816,7 +816,15 @@ public:
     atomic_uint32_t &getNumSceneLoads() { return num_scene_loads_; }
 
 private:
+    AssetLoader renderer_loader_;
+
+    // Futures need to be destroyed before AssetLoader
+    atomic_uint32_t num_scene_loads_;
+    FastFuture<shared_ptr<Scene>> next_scene_future_;
+    shared_ptr<Scene> next_scene_;
+
     BackgroundSceneLoader loader_;
+
     Dataset &dataset_;
 
     uint32_t &active_scene_;
@@ -824,10 +832,6 @@ private:
     uint32_t envs_per_scene_;
 
     mt19937 &rgen_;
-
-    atomic_uint32_t num_scene_loads_;
-    FastFuture<shared_ptr<Scene>> next_scene_future_;
-    shared_ptr<Scene> next_scene_;
 };
 
 class EnvironmentGroup {
