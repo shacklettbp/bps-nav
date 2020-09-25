@@ -740,12 +740,43 @@ private:
     friend class EnvironmentGroup;
 };
 
+static uint32_t num_cores()
+{
+    cpu_set_t cpuset;
+    pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    return CPU_COUNT(&cpuset);
+}
+
+static void set_affinity(uint32_t target_cpu_idx)
+{
+    cpu_set_t cpuset;
+    pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    assert(target_cpu_idx < CPU_COUNT(&cpuset));
+    cpu_set_t worker_set;
+    CPU_ZERO(&worker_set);
+
+    // This is needed incase there was already cpu masking via
+    // a different call to setaffinity or via cgroup (SLURM)
+    for (uint32_t cpu_idx = 0, cpus_found = 0; cpu_idx < CPU_SETSIZE;
+         ++cpu_idx) {
+        if (CPU_ISSET(cpu_idx, &cpuset)) {
+            if (cpus_found == target_cpu_idx) {
+                CPU_SET(cpu_idx, &worker_set);
+                break;
+            } else {
+                ++cpus_found;
+            }
+        }
+    }
+
+    pthread_setaffinity_np(pthread_self(), sizeof(worker_set), &worker_set);
+}
+
 static uint32_t computeNumWorkers(int num_desired_workers)
 {
     assert(num_desired_workers != 0);
     return num_desired_workers == -1 ?
-               max(static_cast<int64_t>(thread::hardware_concurrency()) - 1,
-                   1l) :
+               max(static_cast<int64_t>(num_cores()) - 1, 1l) :
                num_desired_workers;
 }
 
@@ -1236,32 +1267,7 @@ private:
                           uint64_t seed,
                           uint64_t rank)
     {
-        {
-            cpu_set_t cpuset;
-            pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-            const uint32_t num_cores = CPU_COUNT(&cpuset);
-
-            cpu_set_t worker_set;
-            CPU_ZERO(&worker_set);
-
-            // This is needed incase there was already cpu masking via
-            // a different call to setaffinity or via cgroup (SLURM)
-            const uint32_t worker_cpu_idx = rank % num_cores;
-            for (uint32_t cpu_idx = 0, cpus_found = 0; cpu_idx < CPU_SETSIZE;
-                 ++cpu_idx) {
-                if (CPU_ISSET(cpu_idx, &cpuset)) {
-                    if (cpus_found == worker_cpu_idx) {
-                        CPU_SET(cpu_idx, &worker_set);
-                        break;
-                    } else {
-                        ++cpus_found;
-                    }
-                }
-            }
-
-            pthread_setaffinity_np(pthread_self(), sizeof(worker_set),
-                                   &worker_set);
-        }
+        set_affinity(rank % num_cores());
 
         uint32_t end_env_idx = begin_env_idx + num_envs;
         mt19937 rgen(seed);
