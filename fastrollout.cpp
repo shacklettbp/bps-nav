@@ -750,23 +750,22 @@ static py::array_t<T> makeFlatNumpyArray(const vector<T> &vec)
 }
 
 class EnvironmentGroup;
+class SceneTracker;
 
 class ThreadEnvironment {
 public:
     ThreadEnvironment(ThreadEnvironment &&) = default;
 
 private:
-    ThreadEnvironment(uint32_t idx,
-                      Simulator &sim,
-                      esp::nav::PathFinder &pathfinder)
+    ThreadEnvironment(uint32_t idx, Simulator &sim, SceneTracker &scene)
         : idx_(idx),
           sim_(&sim),
-          pathfinder_(&pathfinder)
+          scene_(&scene)
     {}
 
     uint32_t idx_;
     Simulator *sim_;
-    esp::nav::PathFinder *pathfinder_;
+    SceneTracker *scene_;
 
     friend class EnvironmentGroup;
 };
@@ -879,6 +878,30 @@ private:
     mt19937 &rgen_;
 };
 
+class SceneTracker {
+public:
+    SceneTracker(const uint32_t *src_ptr, SceneSwapper *swapper)
+        : src_ptr_(src_ptr),
+          cur_(*src_ptr_),
+          swapper_(swapper)
+    {}
+
+    bool isConsistent() const { return *src_ptr_ == cur_; }
+
+    void update() { cur_ = *src_ptr_; }
+
+    uint32_t curScene() const { return cur_; }
+
+    SceneSwapper &getSwapper() { return *swapper_; }
+    const SceneSwapper &getSwapper() const { return *swapper_; }
+
+private:
+    const uint32_t *src_ptr_;
+    uint32_t cur_;
+
+    SceneSwapper *swapper_;
+};
+
 class EnvironmentGroup {
 public:
     EnvironmentGroup(CommandStreamCUDA &strm,
@@ -946,21 +969,24 @@ public:
                                   &polars_[0].x, py::none());
     }
 
-    ThreadEnvironment makeThreadEnv(uint32_t env_idx,
-                                    vector<esp::nav::PathFinder> &pathfinders)
+    ThreadEnvironment makeThreadEnv(uint32_t env_idx)
     {
         return ThreadEnvironment(env_idx, sim_states_[env_idx],
-                                 pathfinders[env_scenes_[env_idx].curScene()]);
+                                 env_scenes_[env_idx]);
     }
 
-    inline bool step(const ThreadEnvironment &env, int64_t action)
+    inline bool step(const ThreadEnvironment &env,
+                     vector<esp::nav::PathFinder> &pathfinders,
+                     int64_t action)
     {
-        return env.sim_->step(action, *env.pathfinder_);
+        return env.sim_->step(action, pathfinders[env.scene_->curScene()]);
     }
 
-    inline void reset(const ThreadEnvironment &env, mt19937 &rgen)
+    inline void reset(const ThreadEnvironment &env,
+                      vector<esp::nav::PathFinder> &pathfinders,
+                      mt19937 &rgen)
     {
-        env.sim_->reset(*env.pathfinder_, rgen);
+        env.sim_->reset(pathfinders[env.scene_->curScene()], rgen);
     }
 
     bool swapReady(const ThreadEnvironment &env) const
@@ -970,8 +996,7 @@ public:
                !scene_tracker.isConsistent();
     }
 
-    void swapScene(ThreadEnvironment &env,
-                   vector<esp::nav::PathFinder> &pathfinders)
+    void swapScene(ThreadEnvironment &env)
     {
         auto &scene_tracker = env_scenes_[env.idx_];
         SceneSwapper &swapper = scene_tracker.getSwapper();
@@ -988,36 +1013,10 @@ public:
         sim_states_[env.idx_] = Simulator(
             scene_episodes, render_envs_[env.idx_], getPointers(env.idx_));
 
-        env.pathfinder_ = &pathfinders[env_scenes_[env.idx_].curScene()];
-
         swapper.oneLoaded();
     }
 
 private:
-    class SceneTracker {
-    public:
-        SceneTracker(const uint32_t *src_ptr, SceneSwapper *swapper)
-            : src_ptr_(src_ptr),
-              cur_(*src_ptr_),
-              swapper_(swapper)
-        {}
-
-        bool isConsistent() const { return *src_ptr_ == cur_; }
-
-        void update() { cur_ = *src_ptr_; }
-
-        uint32_t curScene() const { return cur_; }
-
-        SceneSwapper &getSwapper() { return *swapper_; }
-        const SceneSwapper &getSwapper() const { return *swapper_; }
-
-    private:
-        const uint32_t *src_ptr_;
-        uint32_t cur_;
-
-        SceneSwapper *swapper_;
-    };
-
     ResultPointers getPointers(uint32_t idx)
     {
         return ResultPointers {
@@ -1052,7 +1051,7 @@ public:
                      bool depth,
                      bool double_buffered,
                      uint64_t seed,
-                     bool should_set_affinity = false)
+                     bool should_set_affinity = true)
         : RolloutGenerator(
               dataset_path,
               asset_path,
@@ -1170,11 +1169,18 @@ private:
           worker_threads_(),
           start_barrier_(),
           finish_barrier_(),
+          next_env_queue_(0),
           active_group_(),
           active_actions_(nullptr),
           sim_reset_(false),
           exit_(false)
     {
+        if ((num_environments % num_active_scenes) != 0) {
+            cerr << "Num environments is not a multiple of the number of "
+                    "active scenes"
+                 << std::endl;
+            exit(1);
+        }
         groups_.reserve(num_groups);
         worker_threads_.reserve(num_workers);
 
@@ -1218,6 +1224,7 @@ private:
 
         uint32_t envs_per_group = num_environments / num_groups;
         uint32_t scenes_per_group = num_active_scenes / num_groups;
+        thread_envs_.reserve(num_environments);
 
         for (uint32_t i = 0; i < num_groups; i++) {
             groups_.emplace_back(
@@ -1227,6 +1234,9 @@ private:
                                      scenes_per_group),
                 Span(&scene_swappers_[i * scenes_per_group],
                      scenes_per_group));
+            for (uint32_t env_idx = 0; env_idx < envs_per_group; env_idx++) {
+                thread_envs_.emplace_back(groups_[i].makeThreadEnv(env_idx));
+            }
         }
 
         for (auto &swapper : scene_swappers_) swapper.startSceneSwap();
@@ -1236,31 +1246,18 @@ private:
 
         const uint32_t num_worker_cores =
             max(num_cores() - (color ? num_scene_loader_cores : 0), 1u);
-        uint32_t envs_per_thread = envs_per_group / num_workers;
-        uint32_t extra_files = envs_per_group - envs_per_thread * num_workers;
 
-        uint32_t thread_env_offset = 0;
         for (uint32_t thread_idx = 0; thread_idx < num_workers; thread_idx++) {
-            uint32_t thread_num_envs = envs_per_thread;
-            if (extra_files > 0) {
-                thread_num_envs++;
-                extra_files--;
-            }
-
-            worker_threads_.emplace_back([this, thread_env_offset,
-                                          thread_num_envs, num_groups, seed,
+            worker_threads_.emplace_back([this, envs_per_group, seed,
                                           thread_idx, color, num_worker_cores,
                                           num_scene_loader_cores,
                                           should_set_affinity]() {
-                simulationWorker(thread_env_offset, thread_num_envs,
-                                 num_groups, seed + thread_env_offset,
+                simulationWorker(envs_per_group, seed + thread_idx,
                                  should_set_affinity ?
                                      (thread_idx % num_worker_cores +
                                       (color ? num_scene_loader_cores : 0)) :
                                      -1);
             });
-
-            thread_env_offset += thread_num_envs;
         }
 
         // Wait for all threads to reach the start of the their work loop.
@@ -1276,6 +1273,7 @@ private:
         active_group_ = active_group;
         active_actions_ = action_ptr;
         sim_reset_ = trigger_reset;
+        next_env_queue_.store(0, memory_order_relaxed);
 
         // My guess is that the barrier wait does this
         // implicitly but it doesn't seem to be defined anywhere
@@ -1287,15 +1285,10 @@ private:
         groups_[active_group].render();
     }
 
-    void simulationWorker(uint32_t begin_env_idx,
-                          uint32_t num_envs,
-                          uint32_t num_groups,
-                          uint64_t seed,
-                          int core_idx)
+    void simulationWorker(uint32_t envs_per_group, uint64_t seed, int core_idx)
     {
         set_affinity(core_idx);
 
-        uint32_t end_env_idx = begin_env_idx + num_envs;
         mt19937 rgen(seed);
 
         vector<esp::nav::PathFinder> thread_pathfinders(dataset_.numScenes());
@@ -1313,17 +1306,6 @@ private:
             }
         }
 
-        vector<ThreadEnvironment> thread_envs;
-        thread_envs.reserve(num_envs * num_groups);
-
-        for (uint32_t group_idx = 0; group_idx < num_groups; group_idx++) {
-            for (uint32_t env_idx = begin_env_idx; env_idx < end_env_idx;
-                 env_idx++) {
-                thread_envs.emplace_back(groups_[group_idx].makeThreadEnv(
-                    env_idx, thread_pathfinders));
-            }
-        }
-
         pthread_barrier_wait(&finish_barrier_);
 
         while (true) {
@@ -1331,28 +1313,26 @@ private:
             if (exit_) {
                 return;
             }
-
             const bool trigger_reset = sim_reset_;
-
             EnvironmentGroup &group = groups_[active_group_];
-            ThreadEnvironment *group_thread_envs =
-                &thread_envs[active_group_ * num_envs];
-            const int64_t *thread_actions = &active_actions_[begin_env_idx];
 
-            for (uint32_t idx = 0; idx < num_envs; idx++) {
-                ThreadEnvironment &env = group_thread_envs[idx];
+            uint32_t next_env;
+            while ((next_env = next_env_queue_.fetch_add(
+                        1, memory_order_acq_rel)) < envs_per_group) {
+                ThreadEnvironment &env =
+                    thread_envs_[next_env + active_group_ * envs_per_group];
 
                 if (trigger_reset) {
-                    group.reset(env, rgen);
+                    group.reset(env, thread_pathfinders, rgen);
                 } else {
-                    bool done = group.step(env, thread_actions[idx]);
-
+                    bool done = group.step(env, thread_pathfinders,
+                                           active_actions_[next_env]);
                     if (done) {
                         if (group.swapReady(env)) {
-                            group.swapScene(env, thread_pathfinders);
+                            group.swapScene(env);
                         }
 
-                        group.reset(env, rgen);
+                        group.reset(env, thread_pathfinders, rgen);
                     }
                 }
             }
@@ -1371,10 +1351,12 @@ private:
     mt19937 rgen_;
     DynArray<SceneSwapper> scene_swappers_;
     vector<EnvironmentGroup> groups_;
+    vector<ThreadEnvironment> thread_envs_;
 
     vector<thread> worker_threads_;
     pthread_barrier_t start_barrier_;
     pthread_barrier_t finish_barrier_;
+    atomic_uint32_t next_env_queue_;
     uint32_t active_group_;
     const int64_t *active_actions_;
     bool sim_reset_;
