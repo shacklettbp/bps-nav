@@ -1179,7 +1179,7 @@ private:
             cerr << "Num environments is not a multiple of the number of "
                     "active scenes"
                  << std::endl;
-            exit(1);
+            abort();
         }
         groups_.reserve(num_groups);
         worker_threads_.reserve(num_workers);
