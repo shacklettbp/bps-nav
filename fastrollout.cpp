@@ -113,8 +113,10 @@ static uint32_t num_cores()
     return CPU_COUNT(&cpuset);
 }
 
-static void set_affinity(uint32_t target_cpu_idx)
+static void set_affinity(int target_cpu_idx)
 {
+    if (target_cpu_idx < 0) return;
+
     cpu_set_t cpuset;
     pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
     assert(target_cpu_idx < CPU_COUNT(&cpuset));
@@ -123,8 +125,7 @@ static void set_affinity(uint32_t target_cpu_idx)
 
     // This is needed incase there was already cpu masking via
     // a different call to setaffinity or via cgroup (SLURM)
-    for (uint32_t cpu_idx = 0, cpus_found = 0; cpu_idx < CPU_SETSIZE;
-         ++cpu_idx) {
+    for (int cpu_idx = 0, cpus_found = 0; cpu_idx < CPU_SETSIZE; ++cpu_idx) {
         if (CPU_ISSET(cpu_idx, &cpuset)) {
             if (cpus_found == target_cpu_idx) {
                 CPU_SET(cpu_idx, &worker_set);
@@ -498,7 +499,7 @@ private:
     {
         nice(19);
 
-        if (core_idx != -1) set_affinity(core_idx);
+        set_affinity(core_idx);
 
         while (true) {
             string scene_path;
@@ -1050,7 +1051,8 @@ public:
                      bool color,
                      bool depth,
                      bool double_buffered,
-                     uint64_t seed)
+                     uint64_t seed,
+                     bool should_set_affinity = false)
         : RolloutGenerator(
               dataset_path,
               asset_path,
@@ -1062,7 +1064,8 @@ public:
               color,
               depth,
               double_buffered ? 2u : 1u,
-              seed)
+              seed,
+              should_set_affinity)
     {}
 
     ~RolloutGenerator()
@@ -1147,7 +1150,8 @@ private:
                      bool color,
                      bool depth,
                      uint32_t num_groups,
-                     uint64_t seed)
+                     uint64_t seed,
+                     bool should_set_affinity)
         : dataset_(dataset_path, asset_path, num_workers),
           renderer_(makeRenderer(gpu_id,
                                  num_environments / num_groups,
@@ -1206,8 +1210,10 @@ private:
 
         for (uint32_t i = 0; i < num_active_scenes; ++i) {
             new (&scene_swappers_[i]) SceneSwapper(
-                renderer_.makeLoader(), i % num_scene_loader_cores, dataset_,
-                active_scenes_[i], inactive_scenes_, envs_per_scene_, rgen_);
+                renderer_.makeLoader(),
+                should_set_affinity ? (i % num_scene_loader_cores) : -1,
+                dataset_, active_scenes_[i], inactive_scenes_, envs_per_scene_,
+                rgen_);
         }
 
         uint32_t envs_per_group = num_environments / num_groups;
@@ -1244,11 +1250,14 @@ private:
             worker_threads_.emplace_back([this, thread_env_offset,
                                           thread_num_envs, num_groups, seed,
                                           thread_idx, color, num_worker_cores,
-                                          num_scene_loader_cores]() {
+                                          num_scene_loader_cores,
+                                          should_set_affinity]() {
                 simulationWorker(thread_env_offset, thread_num_envs,
                                  num_groups, seed + thread_env_offset,
-                                 thread_idx % num_worker_cores +
-                                     (color ? num_scene_loader_cores : 0));
+                                 should_set_affinity ?
+                                     (thread_idx % num_worker_cores +
+                                      (color ? num_scene_loader_cores : 0)) :
+                                     -1);
             });
 
             thread_env_offset += thread_num_envs;
@@ -1282,7 +1291,7 @@ private:
                           uint32_t num_envs,
                           uint32_t num_groups,
                           uint64_t seed,
-                          uint64_t core_idx)
+                          int core_idx)
     {
         set_affinity(core_idx);
 
@@ -1376,6 +1385,9 @@ PYBIND11_MODULE(ddppo_fastrollout, m)
 {
     PYBIND11_NUMPY_DTYPE(StepInfo, success, spl, distanceToGoal);
     py::class_<RolloutGenerator>(m, "RolloutGenerator")
+        .def(py::init<const string &, const string &, uint32_t, uint32_t, int,
+                      int, const array<uint32_t, 2> &, bool, bool, bool,
+                      uint64_t, bool>())
         .def(py::init<const string &, const string &, uint32_t, uint32_t, int,
                       int, const array<uint32_t, 2> &, bool, bool, bool,
                       uint64_t>())
