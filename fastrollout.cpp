@@ -106,6 +106,38 @@ private:
     size_t n_;
 };
 
+static uint32_t num_cores()
+{
+    cpu_set_t cpuset;
+    pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    return CPU_COUNT(&cpuset);
+}
+
+static void set_affinity(uint32_t target_cpu_idx)
+{
+    cpu_set_t cpuset;
+    pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    assert(target_cpu_idx < CPU_COUNT(&cpuset));
+    cpu_set_t worker_set;
+    CPU_ZERO(&worker_set);
+
+    // This is needed incase there was already cpu masking via
+    // a different call to setaffinity or via cgroup (SLURM)
+    for (uint32_t cpu_idx = 0, cpus_found = 0; cpu_idx < CPU_SETSIZE;
+         ++cpu_idx) {
+        if (CPU_ISSET(cpu_idx, &cpuset)) {
+            if (cpus_found == target_cpu_idx) {
+                CPU_SET(cpu_idx, &worker_set);
+                break;
+            } else {
+                ++cpus_found;
+            }
+        }
+    }
+
+    pthread_setaffinity_np(pthread_self(), sizeof(worker_set), &worker_set);
+}
+
 static simdjson::dom::element parseFile(const string &file_path,
                                         size_t num_bytes,
                                         simdjson::dom::parser &parser)
@@ -424,13 +456,13 @@ private:
 };
 
 struct BackgroundSceneLoader {
-    explicit BackgroundSceneLoader(AssetLoader &loader)
+    explicit BackgroundSceneLoader(AssetLoader &loader, int core_idx = -1)
         : loader_ {loader},
           loader_mutex_ {},
           loader_cv_ {},
           loader_exit_ {false},
           loader_requests_ {},
-          loader_thread_ {[&]() { loaderLoop(); }} {};
+          loader_thread_ {[&]() { loaderLoop(core_idx); }} {};
 
     ~BackgroundSceneLoader()
     {
@@ -462,9 +494,11 @@ struct BackgroundSceneLoader {
     }
 
 private:
-    void loaderLoop()
+    void loaderLoop(int core_idx)
     {
         nice(19);
+
+        if (core_idx != -1) set_affinity(core_idx);
 
         while (true) {
             string scene_path;
@@ -527,8 +561,7 @@ class Simulator {
 public:
     Simulator(Span<const Episode> episodes,
               Environment &render_env,
-              ResultPointers ptrs,
-              mt19937 &rgen)
+              ResultPointers ptrs)
         : episodes_(episodes),
           render_env_(&render_env),
           outputs_(ptrs),
@@ -540,17 +573,16 @@ public:
           initial_distance_to_goal_(),
           prev_distance_to_goal_(),
           cumulative_travel_distance_(),
-          step_(),
-          rgen_(rgen())
+          step_()
     {}
 
-    void reset(esp::nav::PathFinder &pathfinder)
+    void reset(esp::nav::PathFinder &pathfinder, mt19937 &rgen)
     {
         step_ = 1;
 
         std::uniform_int_distribution<uint64_t> episode_dist(
             0, episodes_.size() - 1);
-        const Episode &episode = episodes_[episode_dist(rgen_)];
+        const Episode &episode = episodes_[episode_dist(rgen)];
         position_ = episode.startPosition;
         rotation_ = episode.startRotation;
         goal_ = episode.goal;
@@ -704,8 +736,6 @@ private:
     float prev_distance_to_goal_;
     float cumulative_travel_distance_;
     uint32_t step_;
-
-    std::mt19937 rgen_;
 };
 
 template <typename T>
@@ -740,49 +770,30 @@ private:
     friend class EnvironmentGroup;
 };
 
-static uint32_t num_cores()
+static uint32_t computeNumLoaderCores(uint32_t num_active_scenes, bool color)
 {
-    cpu_set_t cpuset;
-    pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-    return CPU_COUNT(&cpuset);
+    if (!color) return num_cores();
+
+    return min(max(num_active_scenes / 2, 1u), num_cores() / 2);
 }
-
-static void set_affinity(uint32_t target_cpu_idx)
-{
-    cpu_set_t cpuset;
-    pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-    assert(target_cpu_idx < CPU_COUNT(&cpuset));
-    cpu_set_t worker_set;
-    CPU_ZERO(&worker_set);
-
-    // This is needed incase there was already cpu masking via
-    // a different call to setaffinity or via cgroup (SLURM)
-    for (uint32_t cpu_idx = 0, cpus_found = 0; cpu_idx < CPU_SETSIZE;
-         ++cpu_idx) {
-        if (CPU_ISSET(cpu_idx, &cpuset)) {
-            if (cpus_found == target_cpu_idx) {
-                CPU_SET(cpu_idx, &worker_set);
-                break;
-            } else {
-                ++cpus_found;
-            }
-        }
-    }
-
-    pthread_setaffinity_np(pthread_self(), sizeof(worker_set), &worker_set);
-}
-
-static uint32_t computeNumWorkers(int num_desired_workers)
+static uint32_t computeNumWorkers(int num_desired_workers,
+                                  uint32_t num_active_scenes,
+                                  bool color)
 {
     assert(num_desired_workers != 0);
-    return num_desired_workers == -1 ?
-               max(static_cast<int64_t>(num_cores()) - 1, 1l) :
-               num_desired_workers;
+    if (num_desired_workers != -1) return num_desired_workers;
+
+    if (color)
+        return max(
+            num_cores() - computeNumLoaderCores(num_active_scenes, color), 1u);
+
+    return num_cores();
 }
 
 class SceneSwapper {
 public:
     SceneSwapper(AssetLoader &&loader,
+                 int background_loader_core_idx,
                  Dataset &dataset,
                  uint32_t &active_scene,
                  std::vector<uint32_t> &inactive_scenes,
@@ -792,7 +803,7 @@ public:
           num_scene_loads_ {0},
           next_scene_future_ {},
           next_scene_ {},
-          loader_ {renderer_loader_},
+          loader_ {renderer_loader_, background_loader_core_idx},
           dataset_ {dataset},
           active_scene_ {active_scene},
           inactive_scenes_ {inactive_scenes},
@@ -811,16 +822,18 @@ public:
     void startSceneSwap()
     {
         assert(canSwapScene());
-        uniform_int_distribution<uint32_t> scene_selector(
-            0, inactive_scenes_.size() - 1);
+        if (inactive_scenes_.size() > 0) {
+            uniform_int_distribution<uint32_t> scene_selector(
+                0, inactive_scenes_.size() - 1);
 
-        uint32_t new_scene_position = scene_selector(rgen_);
+            uint32_t new_scene_position = scene_selector(rgen_);
 
-        swap(inactive_scenes_[new_scene_position], active_scene_);
+            swap(inactive_scenes_[new_scene_position], active_scene_);
 
-        auto scene_path = dataset_.getScenePath(active_scene_);
+            auto scene_path = dataset_.getScenePath(active_scene_);
 
-        next_scene_future_ = loader_.asyncLoadScene(scene_path);
+            next_scene_future_ = loader_.asyncLoadScene(scene_path);
+        }
     }
 
     void preStep()
@@ -870,7 +883,6 @@ public:
     EnvironmentGroup(CommandStreamCUDA &strm,
                      BackgroundSceneLoader &loader,
                      const Dataset &dataset,
-                     mt19937 &rgen,
                      uint32_t envs_per_scene,
                      const Span<const uint32_t> &initial_scene_indices,
                      const Span<SceneSwapper> &scene_swappers)
@@ -903,8 +915,7 @@ public:
                 render_envs_.emplace_back(
                     strm.makeEnvironment(scene, 90, 0.1, 1000));
                 sim_states_.emplace_back(scene_episodes, render_envs_.back(),
-                                         getPointers(sim_states_.size()),
-                                         rgen);
+                                         getPointers(sim_states_.size()));
                 env_scenes_.emplace_back(&scene_idx, &scene_swapper);
             }
         }
@@ -946,9 +957,9 @@ public:
         return env.sim_->step(action, *env.pathfinder_);
     }
 
-    inline void reset(const ThreadEnvironment &env)
+    inline void reset(const ThreadEnvironment &env, mt19937 &rgen)
     {
-        env.sim_->reset(*env.pathfinder_);
+        env.sim_->reset(*env.pathfinder_, rgen);
     }
 
     bool swapReady(const ThreadEnvironment &env) const
@@ -959,8 +970,7 @@ public:
     }
 
     void swapScene(ThreadEnvironment &env,
-                   vector<esp::nav::PathFinder> &pathfinders,
-                   std::mt19937 &rgen)
+                   vector<esp::nav::PathFinder> &pathfinders)
     {
         auto &scene_tracker = env_scenes_[env.idx_];
         SceneSwapper &swapper = scene_tracker.getSwapper();
@@ -974,9 +984,8 @@ public:
 
         auto scene_episodes = dataset_.getEpisodes(scene_idx);
 
-        sim_states_[env.idx_] =
-            Simulator(scene_episodes, render_envs_[env.idx_],
-                      getPointers(env.idx_), rgen);
+        sim_states_[env.idx_] = Simulator(
+            scene_episodes, render_envs_[env.idx_], getPointers(env.idx_));
 
         env.pathfinder_ = &pathfinders[env_scenes_[env.idx_].curScene()];
 
@@ -1042,17 +1051,18 @@ public:
                      bool depth,
                      bool double_buffered,
                      uint64_t seed)
-        : RolloutGenerator(dataset_path,
-                           asset_path,
-                           num_environments,
-                           num_active_scenes,
-                           computeNumWorkers(num_workers),
-                           gpu_id,
-                           render_resolution,
-                           color,
-                           depth,
-                           double_buffered ? 2u : 1u,
-                           seed)
+        : RolloutGenerator(
+              dataset_path,
+              asset_path,
+              num_environments,
+              num_active_scenes,
+              computeNumWorkers(num_workers, num_active_scenes, color),
+              gpu_id,
+              render_resolution,
+              color,
+              depth,
+              double_buffered ? 2u : 1u,
+              seed)
     {}
 
     ~RolloutGenerator()
@@ -1191,10 +1201,13 @@ private:
         assert(num_environments % num_active_scenes == 0);
         assert(num_active_scenes % num_groups == 0);
 
+        const uint32_t num_scene_loader_cores =
+            computeNumLoaderCores(num_active_scenes, color);
+
         for (uint32_t i = 0; i < num_active_scenes; ++i) {
             new (&scene_swappers_[i]) SceneSwapper(
-                renderer_.makeLoader(), dataset_, active_scenes_[i],
-                inactive_scenes_, envs_per_scene_, rgen_);
+                renderer_.makeLoader(), i % num_scene_loader_cores, dataset_,
+                active_scenes_[i], inactive_scenes_, envs_per_scene_, rgen_);
         }
 
         uint32_t envs_per_group = num_environments / num_groups;
@@ -1202,7 +1215,7 @@ private:
 
         for (uint32_t i = 0; i < num_groups; i++) {
             groups_.emplace_back(
-                cmd_strm_, scene_swappers_[0].getLoader(), dataset_, rgen_,
+                cmd_strm_, scene_swappers_[0].getLoader(), dataset_,
                 envs_per_scene_,
                 Span<const uint32_t>(&active_scenes_[i * scenes_per_group],
                                      scenes_per_group),
@@ -1215,6 +1228,8 @@ private:
         pthread_barrier_init(&start_barrier_, nullptr, num_workers + 1);
         pthread_barrier_init(&finish_barrier_, nullptr, num_workers + 1);
 
+        const uint32_t num_worker_cores =
+            max(num_cores() - (color ? num_scene_loader_cores : 0), 1u);
         uint32_t envs_per_thread = envs_per_group / num_workers;
         uint32_t extra_files = envs_per_group - envs_per_thread * num_workers;
 
@@ -1228,10 +1243,12 @@ private:
 
             worker_threads_.emplace_back([this, thread_env_offset,
                                           thread_num_envs, num_groups, seed,
-                                          thread_idx]() {
+                                          thread_idx, color, num_worker_cores,
+                                          num_scene_loader_cores]() {
                 simulationWorker(thread_env_offset, thread_num_envs,
                                  num_groups, seed + thread_env_offset,
-                                 thread_idx);
+                                 thread_idx % num_worker_cores +
+                                     (color ? num_scene_loader_cores : 0));
             });
 
             thread_env_offset += thread_num_envs;
@@ -1265,9 +1282,9 @@ private:
                           uint32_t num_envs,
                           uint32_t num_groups,
                           uint64_t seed,
-                          uint64_t rank)
+                          uint64_t core_idx)
     {
-        set_affinity(rank % num_cores());
+        set_affinity(core_idx);
 
         uint32_t end_env_idx = begin_env_idx + num_envs;
         mt19937 rgen(seed);
@@ -1317,16 +1334,16 @@ private:
                 ThreadEnvironment &env = group_thread_envs[idx];
 
                 if (trigger_reset) {
-                    group.reset(env);
+                    group.reset(env, rgen);
                 } else {
                     bool done = group.step(env, thread_actions[idx]);
 
                     if (done) {
                         if (group.swapReady(env)) {
-                            group.swapScene(env, thread_pathfinders, rgen);
+                            group.swapScene(env, thread_pathfinders);
                         }
 
-                        group.reset(env);
+                        group.reset(env, rgen);
                     }
                 }
             }
