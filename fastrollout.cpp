@@ -1083,7 +1083,7 @@ public:
 
         atomic_thread_fence(memory_order_release);
         end_atomic_.fetch_xor(1, memory_order_release);
-        atomic_notify_all(&end_atomic_);
+        atomic_notify_all(&start_atomic_);
 
         for (auto &t : worker_threads_) {
             t.join();
