@@ -26,6 +26,16 @@
 #include <vector>
 #include <pthread.h>
 
+#define __NO_SPIN
+#include <atomic_wait>
+contended_t contention[256];
+
+contended_t * __contention(volatile void const * p)
+{
+    return contention + ((uintptr_t)p & 255);
+}
+#undef __NO_SPIN
+
 using namespace std;
 using namespace v4r;
 namespace py = pybind11;
@@ -1070,7 +1080,10 @@ public:
     ~RolloutGenerator()
     {
         exit_ = true;
-        pthread_barrier_wait(&start_barrier_);
+
+        atomic_thread_fence(memory_order_release);
+        end_atomic_.fetch_xor(1, memory_order_release);
+        atomic_notify_all(&end_atomic_);
 
         for (auto &t : worker_threads_) {
             t.join();
@@ -1169,6 +1182,9 @@ private:
           worker_threads_(),
           start_barrier_(),
           finish_barrier_(),
+          start_atomic_(),
+          end_atomic_(),
+          workers_finished_(0),
           next_env_queue_(0),
           active_group_(),
           active_actions_(nullptr),
@@ -1273,13 +1289,18 @@ private:
         active_group_ = active_group;
         active_actions_ = action_ptr;
         sim_reset_ = trigger_reset;
-        next_env_queue_.store(0, memory_order_relaxed);
 
-        // My guess is that the barrier wait does this
-        // implicitly but it doesn't seem to be defined anywhere
+        next_env_queue_.store(0, memory_order_relaxed);
+        end_atomic_.store(0, memory_order_relaxed);
+        workers_finished_.store(0, memory_order_relaxed);
+
         atomic_thread_fence(memory_order_release);
-        pthread_barrier_wait(&start_barrier_);
-        pthread_barrier_wait(&finish_barrier_);
+        
+        start_atomic_.fetch_xor(1, memory_order_release);
+        atomic_notify_all(&start_atomic_);
+
+        atomic_wait_explicit(&end_atomic_, 0, memory_order_acquire);
+
         atomic_thread_fence(memory_order_acquire);
 
         groups_[active_group].render();
@@ -1308,8 +1329,11 @@ private:
 
         pthread_barrier_wait(&finish_barrier_);
 
+        uint32_t wait_val = 0;
         while (true) {
-            pthread_barrier_wait(&start_barrier_);
+            atomic_wait_explicit(&start_atomic_, wait_val, memory_order_acquire);
+            wait_val ^= 1;
+
             if (exit_) {
                 return;
             }
@@ -1337,7 +1361,11 @@ private:
                 }
             }
 
-            pthread_barrier_wait(&finish_barrier_);
+            uint32_t threads_finished = workers_finished_.fetch_add(1, memory_order_acq_rel);
+            if (threads_finished == worker_threads_.size() - 1) {
+                end_atomic_.store(1);
+                atomic_notify_one(&end_atomic_);
+            }
         }
     }
 
@@ -1356,6 +1384,10 @@ private:
     vector<thread> worker_threads_;
     pthread_barrier_t start_barrier_;
     pthread_barrier_t finish_barrier_;
+    atomic_uint32_t start_atomic_;
+    atomic_uint32_t end_atomic_;
+    atomic_uint32_t workers_finished_;
+
     atomic_uint32_t next_env_queue_;
     uint32_t active_group_;
     const int64_t *active_actions_;

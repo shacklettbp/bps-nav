@@ -42,3 +42,6 @@ target_include_directories(habitat_sim_geodesic
         habitat-sim-geodesic/habitat_sim_geodesic/csrc)
 
 target_compile_definitions(habitat_sim_geodesic PUBLIC DT_VIRTUAL_QUERYFILTER)
+
+add_library(cpp20sync INTERFACE)
+target_include_directories(cpp20sync INTERFACE cpp20sync)

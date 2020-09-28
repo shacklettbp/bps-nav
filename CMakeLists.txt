@@ -17,4 +17,4 @@ target_compile_options(ddppo_fastrollout PRIVATE -Wall -Wextra -Wshadow)
 
 add_dependencies(ddppo_fastrollout v4r_headless habitat_sim_geodesic)
 target_link_libraries(ddppo_fastrollout
-    PRIVATE v4r_headless habitat_sim_geodesic ZLIB::ZLIB simdjson)
+    PRIVATE v4r_headless habitat_sim_geodesic ZLIB::ZLIB simdjson cpp20sync)
