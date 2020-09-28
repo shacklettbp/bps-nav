@@ -1082,7 +1082,7 @@ public:
         exit_ = true;
 
         atomic_thread_fence(memory_order_release);
-        end_atomic_.fetch_xor(1, memory_order_release);
+        start_atomic_.fetch_xor(1, memory_order_release);
         atomic_notify_all(&start_atomic_);
 
         for (auto &t : worker_threads_) {
