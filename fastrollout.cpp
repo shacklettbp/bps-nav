@@ -26,11 +26,13 @@
 #include <vector>
 #include <pthread.h>
 
+// Spinning will never be beneficial, always takes some time to come back
+// around for the next iteration
 #define __NO_SPIN
 #include <atomic_wait>
 contended_t contention[256];
 
-contended_t * __contention(volatile void const * p)
+contended_t *__contention(volatile void const *p)
 {
     return contention + ((uintptr_t)p & 255);
 }
@@ -782,7 +784,9 @@ private:
 
 static uint32_t computeNumLoaderCores(uint32_t num_active_scenes, bool color)
 {
-    if (!color) return num_cores();
+    if (!color)
+        return max(num_cores() - 1,
+                   1u);  // If possible, leave 1 core for pytorch
 
     return min(max(num_active_scenes / 2, 1u), num_cores() / 2);
 }
@@ -793,11 +797,14 @@ static uint32_t computeNumWorkers(int num_desired_workers,
     assert(num_desired_workers != 0);
     if (num_desired_workers != -1) return num_desired_workers;
 
-    if (color)
-        return max(
-            num_cores() - computeNumLoaderCores(num_active_scenes, color), 1u);
+    uint32_t num_workers = num_cores() - 1;
 
-    return num_cores();
+    if (color) {
+        num_workers -=
+            min(computeNumLoaderCores(num_active_scenes, color), num_workers);
+    }
+
+    return num_workers;
 }
 
 class SceneSwapper {
@@ -1089,8 +1096,7 @@ public:
             t.join();
         }
 
-        pthread_barrier_destroy(&start_barrier_);
-        pthread_barrier_destroy(&finish_barrier_);
+        pthread_barrier_destroy(&ready_barrier_);
     }
 
     void reset(uint32_t group_idx)
@@ -1174,16 +1180,18 @@ private:
                                  num_groups == 2)),
           cmd_strm_(renderer_.makeCommandStream()),
           envs_per_scene_(num_environments / num_active_scenes),
+          envs_per_group_(num_environments / num_groups),
           active_scenes_(),
           inactive_scenes_(),
           rgen_(seed),
           scene_swappers_(num_active_scenes),
           groups_(),
+          thread_envs_(),
+          main_thread_pathfinders_(),
+          wait_target_(1 + num_workers),
           worker_threads_(),
-          start_barrier_(),
-          finish_barrier_(),
+          ready_barrier_(),
           start_atomic_(),
-          end_atomic_(),
           workers_finished_(0),
           next_env_queue_(0),
           active_group_(),
@@ -1227,18 +1235,41 @@ private:
         assert(num_environments % num_active_scenes == 0);
         assert(num_active_scenes % num_groups == 0);
 
-        const uint32_t num_scene_loader_cores =
+        uint32_t num_scene_loader_cores =
             computeNumLoaderCores(num_active_scenes, color);
 
-        for (uint32_t i = 0; i < num_active_scenes; ++i) {
-            new (&scene_swappers_[i]) SceneSwapper(
-                renderer_.makeLoader(),
-                should_set_affinity ? (i % num_scene_loader_cores) : -1,
-                dataset_, active_scenes_[i], inactive_scenes_, envs_per_scene_,
-                rgen_);
+        uint32_t num_worker_cores = num_cores() - 1;
+
+        if (color) {
+            if (num_scene_loader_cores > num_worker_cores) {
+                num_scene_loader_cores = num_worker_cores;
+                num_worker_cores = 0;
+            } else {
+                num_worker_cores -= num_scene_loader_cores;
+            }
         }
 
-        uint32_t envs_per_group = num_environments / num_groups;
+        for (uint32_t i = 0; i < num_active_scenes; ++i) {
+            int core_idx = -1;
+            if (should_set_affinity) {
+                if (color) {
+                    // For RGB, map scene loader cores to after all worker
+                    // cores
+                    core_idx =
+                        1 + num_worker_cores + (i % num_scene_loader_cores);
+                } else {
+                    // For depth, map them to the end of the range so they
+                    // don't overlap with the pytorch thread (this thread /
+                    // core 0)
+                    core_idx = num_cores() - 1 - (i % num_scene_loader_cores);
+                }
+            }
+
+            new (&scene_swappers_[i]) SceneSwapper(
+                renderer_.makeLoader(), core_idx, dataset_, active_scenes_[i],
+                inactive_scenes_, envs_per_scene_, rgen_);
+        }
+
         uint32_t scenes_per_group = num_active_scenes / num_groups;
         thread_envs_.reserve(num_environments);
 
@@ -1250,36 +1281,70 @@ private:
                                      scenes_per_group),
                 Span(&scene_swappers_[i * scenes_per_group],
                      scenes_per_group));
-            for (uint32_t env_idx = 0; env_idx < envs_per_group; env_idx++) {
+            for (uint32_t env_idx = 0; env_idx < envs_per_group_; env_idx++) {
                 thread_envs_.emplace_back(groups_[i].makeThreadEnv(env_idx));
             }
         }
 
         for (auto &swapper : scene_swappers_) swapper.startSceneSwap();
 
-        pthread_barrier_init(&start_barrier_, nullptr, num_workers + 1);
-        pthread_barrier_init(&finish_barrier_, nullptr, num_workers + 1);
+        pthread_barrier_init(&ready_barrier_, nullptr, num_workers + 1);
 
-        const uint32_t num_worker_cores =
-            max(num_cores() - (color ? num_scene_loader_cores : 0), 1u);
+        // This main thread is the first "worker thread", implicitly has
+        // affinity 0, don't want to set as could be inherited by pytorch
+        // stuff later.
+        // set_affinity(should_set_affinity ? 0 : -1);
 
         for (uint32_t thread_idx = 0; thread_idx < num_workers; thread_idx++) {
-            worker_threads_.emplace_back([this, envs_per_group, seed,
-                                          thread_idx, color, num_worker_cores,
-                                          num_scene_loader_cores,
-                                          should_set_affinity]() {
-                simulationWorker(envs_per_group, seed + thread_idx,
-                                 should_set_affinity ?
-                                     (thread_idx % num_worker_cores +
-                                      (color ? num_scene_loader_cores : 0)) :
-                                     -1);
+            int core_idx = should_set_affinity ?
+                               (1 + (thread_idx % num_worker_cores)) :
+                               -1;
+
+            worker_threads_.emplace_back([this, seed, thread_idx, core_idx]() {
+                simulationWorker(seed + 1 + thread_idx, core_idx);
             });
         }
 
+        main_thread_pathfinders_ = initPathfinders();
+
         // Wait for all threads to reach the start of the their work loop.
-        // Not strictly necessary but ensures the first step doesn't take
-        // longer as pathfinders are initialized
-        pthread_barrier_wait(&finish_barrier_);
+        pthread_barrier_wait(&ready_barrier_);
+    }
+
+    inline bool simulate(vector<esp::nav::PathFinder> &thread_pathfinders,
+                         mt19937 &rgen)
+    {
+        const bool trigger_reset = sim_reset_;
+        EnvironmentGroup &group = groups_[active_group_];
+
+        uint32_t next_env;
+        while ((next_env = next_env_queue_.fetch_add(
+                    1, memory_order_acq_rel)) < envs_per_group_) {
+            ThreadEnvironment &env =
+                thread_envs_[next_env + active_group_ * envs_per_group_];
+
+            if (trigger_reset) {
+                group.reset(env, thread_pathfinders, rgen);
+            } else {
+                bool done = group.step(env, thread_pathfinders,
+                                       active_actions_[next_env]);
+                if (done) {
+                    if (group.swapReady(env)) {
+                        group.swapScene(env);
+                    }
+
+                    group.reset(env, thread_pathfinders, rgen);
+                }
+            }
+        }
+
+        // Returns true to a thread when this iteration is done. Used as small
+        // optimization to avoid extra load when main thread finishes last.
+        // worker_threads_.size() is equal to the value that this needs to
+        // be incremented to minus - 1. Conveniently, fetch_add
+        // returns the value before the addition.
+        return workers_finished_.fetch_add(1, memory_order_acq_rel) ==
+               worker_threads_.size();
     }
 
     void simulateAndRender(uint32_t active_group,
@@ -1291,35 +1356,36 @@ private:
         sim_reset_ = trigger_reset;
 
         next_env_queue_.store(0, memory_order_relaxed);
-        end_atomic_.store(0, memory_order_relaxed);
         workers_finished_.store(0, memory_order_relaxed);
 
         atomic_thread_fence(memory_order_release);
-        
+
         start_atomic_.fetch_xor(1, memory_order_release);
         atomic_notify_all(&start_atomic_);
 
-        atomic_wait_explicit(&end_atomic_, 0, memory_order_acquire);
+        bool finished = simulate(main_thread_pathfinders_, rgen_);
+        if (!finished) {
+            while (workers_finished_.load(memory_order_acquire) !=
+                   wait_target_) {
+                asm volatile("pause" ::: "memory");
+            }
+        }
 
         atomic_thread_fence(memory_order_acquire);
 
         groups_[active_group].render();
     }
 
-    void simulationWorker(uint32_t envs_per_group, uint64_t seed, int core_idx)
+    vector<esp::nav::PathFinder> initPathfinders()
     {
-        set_affinity(core_idx);
-
-        mt19937 rgen(seed);
-
-        vector<esp::nav::PathFinder> thread_pathfinders(dataset_.numScenes());
+        vector<esp::nav::PathFinder> pathfinders(dataset_.numScenes());
 
         for (uint32_t scene_idx = 0; scene_idx < dataset_.numScenes();
              scene_idx++) {
             auto navmesh_path = dataset_.getNavmeshPath(scene_idx);
 
-            bool navmesh_success = thread_pathfinders[scene_idx].loadNavMesh(
-                string(navmesh_path));
+            bool navmesh_success =
+                pathfinders[scene_idx].loadNavMesh(string(navmesh_path));
 
             if (!navmesh_success) {
                 cerr << "Failed to load navmesh: " << navmesh_path << endl;
@@ -1327,45 +1393,30 @@ private:
             }
         }
 
-        pthread_barrier_wait(&finish_barrier_);
+        return pathfinders;
+    }
+
+    void simulationWorker(uint64_t seed, int core_idx)
+    {
+        set_affinity(core_idx);
+
+        mt19937 rgen(seed);
+
+        vector<esp::nav::PathFinder> thread_pathfinders = initPathfinders();
+
+        pthread_barrier_wait(&ready_barrier_);
 
         uint32_t wait_val = 0;
         while (true) {
-            atomic_wait_explicit(&start_atomic_, wait_val, memory_order_acquire);
+            atomic_wait_explicit(&start_atomic_, wait_val,
+                                 memory_order_acquire);
             wait_val ^= 1;
 
             if (exit_) {
                 return;
             }
-            const bool trigger_reset = sim_reset_;
-            EnvironmentGroup &group = groups_[active_group_];
 
-            uint32_t next_env;
-            while ((next_env = next_env_queue_.fetch_add(
-                        1, memory_order_acq_rel)) < envs_per_group) {
-                ThreadEnvironment &env =
-                    thread_envs_[next_env + active_group_ * envs_per_group];
-
-                if (trigger_reset) {
-                    group.reset(env, thread_pathfinders, rgen);
-                } else {
-                    bool done = group.step(env, thread_pathfinders,
-                                           active_actions_[next_env]);
-                    if (done) {
-                        if (group.swapReady(env)) {
-                            group.swapScene(env);
-                        }
-
-                        group.reset(env, thread_pathfinders, rgen);
-                    }
-                }
-            }
-
-            uint32_t threads_finished = workers_finished_.fetch_add(1, memory_order_acq_rel);
-            if (threads_finished == worker_threads_.size() - 1) {
-                end_atomic_.store(1);
-                atomic_notify_one(&end_atomic_);
-            }
+            simulate(thread_pathfinders, rgen);
         }
     }
 
@@ -1373,6 +1424,7 @@ private:
     BatchRendererCUDA renderer_;
     CommandStreamCUDA cmd_strm_;
     uint32_t envs_per_scene_;
+    uint32_t envs_per_group_;
     vector<uint32_t> active_scenes_;
     vector<uint32_t> inactive_scenes_;
 
@@ -1380,12 +1432,12 @@ private:
     DynArray<SceneSwapper> scene_swappers_;
     vector<EnvironmentGroup> groups_;
     vector<ThreadEnvironment> thread_envs_;
+    vector<esp::nav::PathFinder> main_thread_pathfinders_;
+    const uint32_t wait_target_;
 
     vector<thread> worker_threads_;
-    pthread_barrier_t start_barrier_;
-    pthread_barrier_t finish_barrier_;
+    pthread_barrier_t ready_barrier_;
     atomic_uint32_t start_atomic_;
-    atomic_uint32_t end_atomic_;
     atomic_uint32_t workers_finished_;
 
     atomic_uint32_t next_env_queue_;
