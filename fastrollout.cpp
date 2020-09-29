@@ -537,10 +537,10 @@ private:
                              .count();
             if (delta < RATE_LIMIT) usleep(RATE_LIMIT - delta);
 
+            lastTime = std::chrono::system_clock::now();
+
             auto scene = loader_.loadScene(scene_path);
             loader_promise.set_result(move(scene));
-
-            lastTime = std::chrono::system_clock::now();
         }
     };
 
