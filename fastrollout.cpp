@@ -557,12 +557,11 @@ struct ResultPointers {
     glm::vec2 *polar;
 };
 
-static inline float computeGeoDist(const esp::nav::NavMeshPoint &start,
+static inline float computeGeoDist(esp::nav::ShortestPath &test_path,
+                                   const esp::nav::NavMeshPoint &start,
                                    const esp::nav::NavMeshPoint &end,
                                    esp::nav::PathFinder &pathfinder)
 {
-    esp::nav::ShortestPath test_path;
-
     test_path.requestedStart = start;
     test_path.requestedEnd = end;
 
@@ -605,8 +604,8 @@ public:
             Eigen::Map<const esp::vec3f>(glm::value_ptr(position_)));
 
         cumulative_travel_distance_ = 0;
-        initial_distance_to_goal_ =
-            computeGeoDist(navmeshPosition_, navmeshGoal_, pathfinder);
+        initial_distance_to_goal_ = computeGeoDist(
+            test_path_, navmeshPosition_, navmeshGoal_, pathfinder);
         prev_distance_to_goal_ = initial_distance_to_goal_;
 
         updateObservationState();
@@ -625,8 +624,8 @@ public:
 
         if (action == SimAction::Stop) {
             done = true;
-            distance_to_goal =
-                computeGeoDist(navmeshGoal_, navmeshPosition_, pathfinder);
+            distance_to_goal = computeGeoDist(test_path_, navmeshGoal_,
+                                              navmeshPosition_, pathfinder);
             success =
                 float(distance_to_goal < SimulatorConfig::SUCCESS_DISTANCE);
             spl = success * initial_distance_to_goal_ /
@@ -639,8 +638,8 @@ public:
             updateObservationState();
 
             if (position_updated) {
-                distance_to_goal =
-                    computeGeoDist(navmeshGoal_, navmeshPosition_, pathfinder);
+                distance_to_goal = computeGeoDist(
+                    test_path_, navmeshGoal_, navmeshPosition_, pathfinder);
                 reward += prev_distance_to_goal_ - distance_to_goal;
 
                 cumulative_travel_distance_ +=
@@ -744,6 +743,7 @@ private:
 
     esp::nav::NavMeshPoint navmeshPosition_;
     esp::nav::NavMeshPoint navmeshGoal_;
+    esp::nav::ShortestPath test_path_;
 
     float initial_distance_to_goal_;
     float prev_distance_to_goal_;
@@ -1205,6 +1205,7 @@ private:
                  << std::endl;
             abort();
         }
+
         groups_.reserve(num_groups);
         worker_threads_.reserve(num_workers);
 
@@ -1290,11 +1291,6 @@ private:
 
         pthread_barrier_init(&ready_barrier_, nullptr, num_workers + 1);
 
-        // This main thread is the first "worker thread", implicitly has
-        // affinity 0, don't want to set as could be inherited by pytorch
-        // stuff later.
-        // set_affinity(should_set_affinity ? 0 : -1);
-
         for (uint32_t thread_idx = 0; thread_idx < num_workers; thread_idx++) {
             int core_idx = should_set_affinity ?
                                (1 + (thread_idx % num_worker_cores)) :
@@ -1304,6 +1300,11 @@ private:
                 simulationWorker(seed + 1 + thread_idx, core_idx);
             });
         }
+
+        // This main thread is the first "worker thread", implicitly has
+        // affinity 0, don't want to set as could be inherited by pytorch
+        // stuff later.
+        set_affinity(should_set_affinity ? 0 : -1);
 
         main_thread_pathfinders_ = initPathfinders();
 
