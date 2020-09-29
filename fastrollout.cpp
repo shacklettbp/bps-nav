@@ -512,6 +512,7 @@ private:
         nice(19);
 
         set_affinity(core_idx);
+        auto lastTime = std::chrono::system_clock::now();
 
         while (true) {
             string scene_path;
@@ -531,11 +532,19 @@ private:
                 loader_requests_.pop();
             }
 
+            auto delta = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::system_clock::now() - lastTime)
+                             .count();
+            if (delta < RATE_LIMIT) usleep(RATE_LIMIT - delta);
+
             auto scene = loader_.loadScene(scene_path);
             loader_promise.set_result(move(scene));
+
+            lastTime = std::chrono::system_clock::now();
         }
     };
 
+    const uint32_t RATE_LIMIT = 1000000;
     AssetLoader &loader_;
     mutex loader_mutex_;
     condition_variable loader_cv_;
