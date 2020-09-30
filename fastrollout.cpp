@@ -808,10 +808,14 @@ static uint32_t computeNumWorkers(int num_desired_workers,
 
     uint32_t num_workers = num_cores() - 1;
 
+    (void)num_active_scenes;
+    (void)color;
+#if 0
     if (color) {
         num_workers -=
             min(computeNumLoaderCores(num_active_scenes, color), num_workers);
     }
+#endif
 
     return num_workers;
 }
@@ -1250,6 +1254,7 @@ private:
 
         uint32_t num_worker_cores = num_cores() - 1;
 
+#if 0
         if (color) {
             if (num_scene_loader_cores > num_worker_cores) {
                 num_scene_loader_cores = num_worker_cores;
@@ -1258,11 +1263,12 @@ private:
                 num_worker_cores -= num_scene_loader_cores;
             }
         }
+#endif
 
         for (uint32_t i = 0; i < num_active_scenes; ++i) {
             int core_idx = -1;
             if (should_set_affinity) {
-                if (color) {
+                if (false && color) {
                     // For RGB, map scene loader cores to after all worker
                     // cores
                     core_idx =
