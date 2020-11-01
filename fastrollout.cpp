@@ -797,7 +797,7 @@ static uint32_t computeNumLoaderCores(uint32_t num_active_scenes, bool color)
         return max(num_cores() - 1,
                    1u);  // If possible, leave 1 core for pytorch
 
-    return min(max(num_active_scenes / 2, 1u), num_cores() / 2);
+    return min(max(num_active_scenes, 1u), num_cores() / 2);
 }
 static uint32_t computeNumWorkers(int num_desired_workers,
                                   uint32_t num_active_scenes,
@@ -874,13 +874,16 @@ public:
         }
     }
 
-    void postStep()
+    bool postStep()
     {
         if (next_scene_ != nullptr &&
             num_scene_loads_.load(memory_order_relaxed) == 0) {
             next_scene_ = nullptr;
             startSceneSwap();
+            return true;
         }
+
+        return false;
     }
 
     void oneLoaded() { num_scene_loads_.fetch_sub(1, memory_order_relaxed); }
@@ -973,6 +976,22 @@ public:
                 env_scenes_.emplace_back(&scene_idx, &scene_swapper);
             }
         }
+    }
+
+    std::tuple<float, float> sceneStats()
+    {
+        std::unordered_map<uint32_t, uint32_t> counts_per_scene;
+        for (auto &tracker : env_scenes_) {
+            auto p = counts_per_scene.emplace(tracker.curScene(), 0);
+            ++(p.first->second);
+        }
+
+        const float num_scenes = counts_per_scene.size();
+        float avg_count = 0;
+        for (auto &p : counts_per_scene) avg_count += p.second;
+        avg_count /= num_scenes;
+
+        return {num_scenes, avg_count};
     }
 
     void render() { cmd_strm_.render(render_envs_); }
@@ -1117,17 +1136,48 @@ public:
         simulateAndRender(group_idx, true, nullptr);
     }
 
-    // action_ptr is a uint64_t to match torch.tensor.data_ptr()
-    void step(uint32_t group_idx,
-              const py::array_t<int64_t, py::array::c_style> &actions)
+    void stepStart(uint32_t group_idx,
+                   const py::array_t<int64_t, py::array::c_style> &actions)
     {
         for (auto &swapper : scene_swappers_) swapper.preStep();
 
         auto action_raw = actions.unchecked<1>();
 
-        simulateAndRender(group_idx, false, action_raw.data(0));
+        simulateStart(group_idx, false, action_raw.data(0));
 
-        for (auto &swapper : scene_swappers_) swapper.postStep();
+        num_steps_taken_ += actions.shape(0);
+    }
+
+    void stepEnd(uint32_t group_idx)
+    {
+        simulateEnd(group_idx);
+        for (auto &swapper : scene_swappers_)
+            num_scenes_swapped_ += swapper.postStep() ? 1 : 0;
+    };
+
+    void render(uint32_t group_idx) { groups_[group_idx].render(); }
+
+    // action_ptr is a uint64_t to match torch.tensor.data_ptr()
+    void step(uint32_t group_idx,
+              const py::array_t<int64_t, py::array::c_style> &actions)
+    {
+        stepStart(group_idx, actions);
+        stepEnd(group_idx);
+        render(group_idx);
+    }
+
+    std::tuple<float, float, float> swapStats()
+    {
+        auto groupStats = groups_[0].sceneStats();
+        for (uint32_t i = 1; i < groups_.size(); ++i) {
+            auto otherStats = groups_[i].sceneStats();
+            std::get<0>(groupStats) += std::get<0>(otherStats);
+            std::get<1>(groupStats) += std::get<1>(otherStats);
+        }
+
+        return {static_cast<double>(num_scenes_swapped_) /
+                    static_cast<double>(num_steps_taken_) * 100.0,
+                std::get<0>(groupStats), std::get<1>(groupStats)};
     }
 
     py::array_t<float> getRewards(uint32_t group_idx) const
@@ -1205,7 +1255,7 @@ private:
           worker_threads_(),
           ready_barrier_(),
           start_atomic_(),
-          workers_finished_(0),
+          workers_finished_(1 + num_workers),
           next_env_queue_(0),
           active_group_(),
           active_actions_(nullptr),
@@ -1363,10 +1413,15 @@ private:
                worker_threads_.size();
     }
 
-    void simulateAndRender(uint32_t active_group,
-                           bool trigger_reset,
-                           const int64_t *action_ptr)
+    void simulateStart(uint32_t active_group,
+                       bool trigger_reset,
+                       const int64_t *action_ptr)
     {
+        if (workers_finished_.load(memory_order_acquire) != wait_target_) {
+            cerr << "Not done with previous simulation" << endl;
+            abort();
+        }
+
         active_group_ = active_group;
         active_actions_ = action_ptr;
         sim_reset_ = trigger_reset;
@@ -1378,6 +1433,21 @@ private:
 
         start_atomic_.fetch_xor(1, memory_order_release);
         atomic_notify_all(&start_atomic_);
+    }
+
+    void simulateEnd(uint32_t active_group)
+    {
+        if (workers_finished_.load(memory_order_acquire) == wait_target_) {
+            cerr << "Simulation already done" << endl;
+            abort();
+        }
+
+        if (active_group != active_group_) {
+            cerr << "Group to end simulation differs from currently active "
+                    "group"
+                 << endl;
+            abort();
+        }
 
         bool finished = simulate(main_thread_pathfinders_, rgen_);
         if (!finished) {
@@ -1388,8 +1458,16 @@ private:
         }
 
         atomic_thread_fence(memory_order_acquire);
+    }
 
-        groups_[active_group].render();
+    void simulateAndRender(uint32_t active_group,
+                           bool trigger_reset,
+                           const int64_t *action_ptr)
+    {
+        simulateStart(active_group, trigger_reset, action_ptr);
+        simulateEnd(active_group);
+
+        render(active_group);
     }
 
     vector<esp::nav::PathFinder> initPathfinders()
@@ -1461,6 +1539,9 @@ private:
     const int64_t *active_actions_;
     bool sim_reset_;
     bool exit_;
+
+    uint64_t num_steps_taken_ = 0;
+    uint64_t num_scenes_swapped_ = 0;
 };
 
 PYBIND11_MODULE(ddppo_fastrollout, m)
@@ -1475,6 +1556,9 @@ PYBIND11_MODULE(ddppo_fastrollout, m)
                       uint64_t>())
         .def("wait_for_frame", &RolloutGenerator::waitForFrame)
         .def("step", &RolloutGenerator::step)
+        .def("step_start", &RolloutGenerator::stepStart)
+        .def("step_end", &RolloutGenerator::stepEnd)
+        .def("render", &RolloutGenerator::render)
         .def("reset", &RolloutGenerator::reset)
         .def("rgba", &RolloutGenerator::getColorMemory)
         .def("depth", &RolloutGenerator::getDepthMemory)
@@ -1482,5 +1566,6 @@ PYBIND11_MODULE(ddppo_fastrollout, m)
         .def("get_rewards", &RolloutGenerator::getRewards)
         .def("get_masks", &RolloutGenerator::getMasks)
         .def("get_infos", &RolloutGenerator::getInfos)
-        .def("get_polars", &RolloutGenerator::getPolars);
+        .def("get_polars", &RolloutGenerator::getPolars)
+        .def_property_readonly("swap_stats", &RolloutGenerator::swapStats);
 }
