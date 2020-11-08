@@ -125,7 +125,7 @@ static uint32_t num_cores()
     return CPU_COUNT(&cpuset);
 }
 
-static void set_affinity(int target_cpu_idx)
+static void set_affinity(int target_cpu_idx, int num_cpus = 1)
 {
     if (target_cpu_idx < 0) return;
 
@@ -137,13 +137,16 @@ static void set_affinity(int target_cpu_idx)
 
     // This is needed incase there was already cpu masking via
     // a different call to setaffinity or via cgroup (SLURM)
-    for (int cpu_idx = 0, cpus_found = 0; cpu_idx < CPU_SETSIZE; ++cpu_idx) {
+    for (int cpu_idx = 0, cpus_found = 0, cpus_set = 0; cpu_idx < CPU_SETSIZE;
+         ++cpu_idx) {
         if (CPU_ISSET(cpu_idx, &cpuset)) {
-            if (cpus_found == target_cpu_idx) {
+            if ((cpus_found++) == target_cpu_idx) {
                 CPU_SET(cpu_idx, &worker_set);
-                break;
-            } else {
-                ++cpus_found;
+
+                if ((++cpus_set) == num_cpus)
+                    break;
+                else
+                    ++target_cpu_idx;
             }
         }
     }
@@ -469,13 +472,16 @@ private:
 };
 
 struct BackgroundSceneLoader {
-    explicit BackgroundSceneLoader(AssetLoader &loader, int core_idx = -1)
+    explicit BackgroundSceneLoader(AssetLoader &loader,
+                                   int core_idx = -1,
+                                   int loader_num_cores = 1)
         : loader_ {loader},
           loader_mutex_ {},
           loader_cv_ {},
           loader_exit_ {false},
           loader_requests_ {},
-          loader_thread_ {[&]() { loaderLoop(core_idx); }} {};
+          loader_thread_ {
+              [&]() { loaderLoop(core_idx, loader_num_cores); }} {};
 
     ~BackgroundSceneLoader()
     {
@@ -507,11 +513,11 @@ struct BackgroundSceneLoader {
     }
 
 private:
-    void loaderLoop(int core_idx)
+    void loaderLoop(int core_idx, int num_cores)
     {
         nice(19);
 
-        set_affinity(core_idx);
+        set_affinity(core_idx, num_cores);
         auto lastTime = std::chrono::system_clock::now();
 
         while (true) {
@@ -824,6 +830,7 @@ class SceneSwapper {
 public:
     SceneSwapper(AssetLoader &&loader,
                  int background_loader_core_idx,
+                 int background_loader_num_cores,
                  Dataset &dataset,
                  uint32_t &active_scene,
                  std::vector<uint32_t> &inactive_scenes,
@@ -833,7 +840,8 @@ public:
           num_scene_loads_ {0},
           next_scene_future_ {},
           next_scene_ {},
-          loader_ {renderer_loader_, background_loader_core_idx},
+          loader_ {renderer_loader_, background_loader_core_idx,
+                   background_loader_num_cores},
           dataset_ {dataset},
           active_scene_ {active_scene},
           inactive_scenes_ {inactive_scenes},
@@ -1327,13 +1335,14 @@ private:
                     // For depth, map them to the end of the range so they
                     // don't overlap with the pytorch thread (this thread /
                     // core 0)
-                    core_idx = num_cores() - 1 - (i % num_scene_loader_cores);
+                    core_idx = num_cores() - num_scene_loader_cores;
                 }
             }
 
             new (&scene_swappers_[i]) SceneSwapper(
-                renderer_.makeLoader(), core_idx, dataset_, active_scenes_[i],
-                inactive_scenes_, envs_per_scene_, rgen_);
+                renderer_.makeLoader(), core_idx, num_scene_loader_cores,
+                dataset_, active_scenes_[i], inactive_scenes_, envs_per_scene_,
+                rgen_);
         }
 
         uint32_t scenes_per_group = num_active_scenes / num_groups;
