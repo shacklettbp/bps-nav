@@ -372,12 +372,21 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
     // options |= RenderOptions::CpuSynchronization;
 
     auto make = [&](auto features) {
+        cudaSetDevice(gpu_id);
+        size_t free_gpu_mem, total_gpu_mem;
+        auto res [[maybe_unused]] = cudaMemGetInfo(&free_gpu_mem, &total_gpu_mem);
+        assert(res == cudaSuccess);
+
+        // Leave 1 GiB for non texture stuff. Super scientific.
+        free_gpu_mem -= (1 << 30);
+
         return BatchRendererCUDA(
             {
                 gpu_id,       // gpuID
                 num_loaders,  // numLoaders
                 1,            // numStreams
                 renderer_batch_size, resolution[1], resolution[0],
+                free_gpu_mem,
                 glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1,
                           -1.19209e-07, 0, 0, 0, 0,
                           1),  // Habitat coordinate txfm matrix
