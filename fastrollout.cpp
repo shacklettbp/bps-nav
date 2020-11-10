@@ -1241,6 +1241,15 @@ public:
         cmd_strm_.waitForFrame(groupIdx);
     }
 
+    void printRendererStats() const {
+        Statistics renderer_stats = renderer_.getStatistics();
+
+        cout << "Renderer Statistics -- "
+             << "Input Setup: " << renderer_stats.inputSetup << " "
+             << "Command Record: " << renderer_stats.commandRecord << " "
+             << "Command Submission: " << renderer_stats.renderSubmit << endl;
+    }
+
 private:
     RolloutGenerator(const string &dataset_path,
                      const string &asset_path,
@@ -1589,5 +1598,6 @@ PYBIND11_MODULE(ddppo_fastrollout, m)
         .def("get_masks", &RolloutGenerator::getMasks)
         .def("get_infos", &RolloutGenerator::getInfos)
         .def("get_polars", &RolloutGenerator::getPolars)
+        .def("print_renderer_stats", &RolloutGenerator::printRendererStats)
         .def_property_readonly("swap_stats", &RolloutGenerator::swapStats);
 }
