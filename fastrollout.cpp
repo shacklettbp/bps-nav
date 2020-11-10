@@ -374,7 +374,8 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
     auto make = [&](auto features) {
         cudaSetDevice(gpu_id);
         size_t free_gpu_mem, total_gpu_mem;
-        auto res [[maybe_unused]] = cudaMemGetInfo(&free_gpu_mem, &total_gpu_mem);
+        auto res [[maybe_unused]] =
+            cudaMemGetInfo(&free_gpu_mem, &total_gpu_mem);
         assert(res == cudaSuccess);
 
         // Leave 1 GiB for non texture stuff. Super scientific.
@@ -559,7 +560,10 @@ private:
         }
     };
 
-    const uint32_t RATE_LIMIT = 1000000;
+    const uint32_t RATE_LIMIT =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::seconds(1))
+            .count();
     AssetLoader &loader_;
     mutex loader_mutex_;
     condition_variable loader_cv_;
