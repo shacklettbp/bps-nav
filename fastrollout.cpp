@@ -23,6 +23,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 #include <pthread.h>
 
@@ -387,7 +388,7 @@ BatchRendererCUDA makeRenderer(int32_t gpu_id,
                 num_loaders,  // numLoaders
                 1,            // numStreams
                 renderer_batch_size, resolution[1], resolution[0],
-                free_gpu_mem,
+                // free_gpu_mem,
                 glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1,
                           -1.19209e-07, 0, 0, 0, 0,
                           1),  // Habitat coordinate txfm matrix
@@ -572,19 +573,6 @@ private:
     thread loader_thread_;
 };
 
-struct StepInfo {
-    float success;
-    float spl;
-    float distanceToGoal;
-};
-
-struct ResultPointers {
-    float *reward;
-    uint8_t *mask;
-    StepInfo *info;
-    glm::vec2 *polar;
-};
-
 static inline float computeGeoDist(esp::nav::ShortestPath &test_path,
                                    const esp::nav::NavMeshPoint &start,
                                    const esp::nav::NavMeshPoint &end,
@@ -597,24 +585,41 @@ static inline float computeGeoDist(esp::nav::ShortestPath &test_path,
     return test_path.geodesicDistance;
 }
 
-class Simulator {
+template <class RewardFunctor, class InfoFunctor>
+class BaseSimulator {
 public:
-    Simulator(Span<const Episode> episodes,
-              Environment &render_env,
-              ResultPointers ptrs)
+    typedef typename InfoFunctor::StepInfo StepInfo;
+
+    struct ResultPointers {
+        float *reward;
+        uint8_t *mask;
+        typename InfoFunctor::StepInfo *info;
+        glm::vec2 *polar;
+    };
+
+    BaseSimulator(Span<const Episode> episodes,
+                  Environment &render_env,
+                  ResultPointers ptrs)
         : episodes_(episodes),
           render_env_(&render_env),
           outputs_(ptrs),
+          episode_(),
           position_(),
           rotation_(),
           goal_(),
           navmeshPosition_(),
-          navmeshGoal_(),
-          initial_distance_to_goal_(),
-          prev_distance_to_goal_(),
-          cumulative_travel_distance_(),
-          step_()
+          step_(),
+          reward_func_(new RewardFunctor()),
+          info_func_(new InfoFunctor())
     {}
+
+    ~BaseSimulator()
+    {
+        delete reward_func_;
+        delete info_func_;
+    }
+
+    void setEpisode(Span<const Episode> episodes) { episodes_ = episodes; }
 
     void reset(esp::nav::PathFinder &pathfinder, mt19937 &rgen)
     {
@@ -622,21 +627,17 @@ public:
 
         std::uniform_int_distribution<uint64_t> episode_dist(
             0, episodes_.size() - 1);
-        const Episode &episode = episodes_[episode_dist(rgen)];
-        position_ = episode.startPosition;
-        rotation_ = episode.startRotation;
-        goal_ = episode.goal;
-        navmeshGoal_ = pathfinder.snapPoint(
-            Eigen::Map<const esp::vec3f>(glm::value_ptr(episode.goal)));
+        episode_ = &episodes_[episode_dist(rgen)];
+        position_ = episode_->startPosition;
+        rotation_ = episode_->startRotation;
+        goal_ = episode_->goal;
         navmeshPosition_ = pathfinder.snapPoint(
             Eigen::Map<const esp::vec3f>(glm::value_ptr(position_)));
 
-        cumulative_travel_distance_ = 0;
-        initial_distance_to_goal_ = computeGeoDist(
-            test_path_, navmeshPosition_, navmeshGoal_, pathfinder);
-        prev_distance_to_goal_ = initial_distance_to_goal_;
-
         updateObservationState();
+
+        StepInfo info = info_func_->reset(*this, pathfinder);
+        reward_func_->reset(*this, pathfinder, info);
     }
 
     bool step(int64_t raw_action, esp::nav::PathFinder &pathfinder)
@@ -644,48 +645,18 @@ public:
         SimAction action {raw_action};
         step_++;
         bool done = step_ >= SimulatorConfig::MAX_STEPS;
-        float reward = -SimulatorConfig::SLACK_REWARD;
-
-        float distance_to_goal = 0;
-        float success = 0;
-        float spl = 0;
+        position_updated_ = false;
 
         if (action == SimAction::Stop) {
             done = true;
-            distance_to_goal = computeGeoDist(test_path_, navmeshGoal_,
-                                              navmeshPosition_, pathfinder);
-            success =
-                float(distance_to_goal < SimulatorConfig::SUCCESS_DISTANCE);
-            spl = success * initial_distance_to_goal_ /
-                  max(initial_distance_to_goal_, cumulative_travel_distance_),
-            reward += SimulatorConfig::SUCCESS_REWARD * spl;
         } else {
-            glm::vec3 prev_position = position_;
-
-            bool position_updated = handleMovement(action, pathfinder);
+            position_updated_ = handleMovement(action, pathfinder);
             updateObservationState();
-
-            if (position_updated) {
-                distance_to_goal = computeGeoDist(
-                    test_path_, navmeshGoal_, navmeshPosition_, pathfinder);
-                reward += prev_distance_to_goal_ - distance_to_goal;
-
-                cumulative_travel_distance_ +=
-                    glm::length(position_ - prev_position);
-
-                prev_distance_to_goal_ = distance_to_goal;
-            } else {
-                distance_to_goal = prev_distance_to_goal_;
-            }
         }
 
-        StepInfo info {
-            success,
-            spl,
-            distance_to_goal,
-        };
+        StepInfo info = info_func_->step(*this, pathfinder, done);
 
-        *outputs_.reward = reward;
+        *outputs_.reward = reward_func_->step(*this, pathfinder, info, done);
         *outputs_.mask = done ? 0 : 1;
         *outputs_.info = info;
 
@@ -761,23 +732,294 @@ private:
         }
     }
 
+    friend RewardFunctor;
+    friend InfoFunctor;
+
     Span<const Episode> episodes_;
     Environment *render_env_;
     ResultPointers outputs_;
+    const Episode *episode_;
 
     glm::vec3 position_;
     glm::quat rotation_;
     glm::vec3 goal_;
 
     esp::nav::NavMeshPoint navmeshPosition_;
-    esp::nav::NavMeshPoint navmeshGoal_;
     esp::nav::ShortestPath test_path_;
+    bool position_updated_ = false;
 
-    float initial_distance_to_goal_;
-    float prev_distance_to_goal_;
-    float cumulative_travel_distance_;
     uint32_t step_;
+
+    RewardFunctor *reward_func_;
+    InfoFunctor *info_func_;
 };
+
+namespace PointNav {
+struct RewardFunctor;
+
+struct InfoFunctor {
+    struct StepInfo {
+        float success;
+        float spl;
+        float distanceToGoal;
+    };
+
+    StepInfo reset(BaseSimulator<RewardFunctor, InfoFunctor> &sim,
+                   esp::nav::PathFinder &pathfinder)
+    {
+        navmeshGoal_ = pathfinder.snapPoint(
+            Eigen::Map<const esp::vec3f>(glm::value_ptr(sim.goal_)));
+        cumulative_travel_distance_ = 0;
+        initial_distance_to_goal_ = computeGeoDist(
+            sim.test_path_, sim.navmeshPosition_, navmeshGoal_, pathfinder);
+        prev_distance_to_goal_ = initial_distance_to_goal_;
+        prev_position_ = sim.position_;
+
+        return {0.0, 0.0, prev_distance_to_goal_};
+    }
+
+    StepInfo step(BaseSimulator<RewardFunctor, InfoFunctor> &sim,
+                  esp::nav::PathFinder &pathfinder,
+                  const bool done)
+    {
+        float distance_to_goal = 0;
+        float success = 0;
+        float spl = 0;
+        if (done) {
+            distance_to_goal =
+                computeGeoDist(sim.test_path_, navmeshGoal_,
+                               sim.navmeshPosition_, pathfinder);
+            success =
+                float(distance_to_goal < SimulatorConfig::SUCCESS_DISTANCE);
+            spl = success * initial_distance_to_goal_ /
+                  max(initial_distance_to_goal_, cumulative_travel_distance_);
+        } else {
+            if (sim.position_updated_) {
+                distance_to_goal =
+                    computeGeoDist(sim.test_path_, navmeshGoal_,
+                                   sim.navmeshPosition_, pathfinder);
+
+                cumulative_travel_distance_ +=
+                    glm::length(sim.position_ - prev_position_);
+
+                prev_distance_to_goal_ = distance_to_goal;
+                prev_position_ = sim.position_;
+            } else {
+                distance_to_goal = prev_distance_to_goal_;
+            }
+        }
+
+        return {success, spl, distance_to_goal};
+    }
+
+    float prev_distance_to_goal_ = 0.0;
+    float cumulative_travel_distance_ = 0.0;
+    float initial_distance_to_goal_ = 0.0;
+    glm::vec3 prev_position_;
+
+    esp::nav::NavMeshPoint navmeshGoal_;
+};
+
+struct RewardFunctor {
+    void reset(BaseSimulator<RewardFunctor, InfoFunctor> &,
+               esp::nav::PathFinder &,
+               const InfoFunctor::StepInfo &info)
+    {
+        prev_distance_to_goal_ = info.distanceToGoal;
+    }
+
+    float step(BaseSimulator<RewardFunctor, InfoFunctor> &,
+               esp::nav::PathFinder &,
+               const BaseSimulator<RewardFunctor, InfoFunctor>::StepInfo &info,
+               const bool done)
+    {
+        float reward = -SimulatorConfig::SLACK_REWARD;
+        if (done) {
+            reward += SimulatorConfig::SUCCESS_REWARD * info.spl;
+        } else {
+            reward += prev_distance_to_goal_ - info.distanceToGoal;
+        }
+        prev_distance_to_goal_ = info.distanceToGoal;
+
+        return reward;
+    }
+
+    float prev_distance_to_goal_ = 0.0;
+};
+
+using Simulator = BaseSimulator<RewardFunctor, InfoFunctor>;
+}
+
+namespace Flee {
+struct RewardFunctor;
+
+struct InfoFunctor {
+    struct StepInfo {
+        float distanceFromStart;
+    };
+
+    StepInfo reset(BaseSimulator<RewardFunctor, InfoFunctor> &sim,
+                   esp::nav::PathFinder &)
+    {
+        navmeshStart_ = sim.navmeshPosition_;
+        distance_from_start_ = 0.0;
+        return {distance_from_start_};
+    }
+
+    StepInfo step(BaseSimulator<RewardFunctor, InfoFunctor> &sim,
+                  esp::nav::PathFinder &pathfinder,
+                  const bool)
+    {
+        if (sim.position_updated_) {
+            distance_from_start_ =
+                computeGeoDist(sim.test_path_, navmeshStart_,
+                               sim.navmeshPosition_, pathfinder);
+        }
+
+        return {distance_from_start_};
+    }
+
+    float distance_from_start_;
+    esp::nav::NavMeshPoint navmeshStart_;
+};
+
+struct RewardFunctor {
+    void reset(BaseSimulator<RewardFunctor, InfoFunctor> &,
+               esp::nav::PathFinder &,
+               const InfoFunctor::StepInfo &info)
+    {
+        prev_distance_from_start_ = info.distanceFromStart;
+    }
+
+    float step(BaseSimulator<RewardFunctor, InfoFunctor> &,
+               esp::nav::PathFinder &,
+               const BaseSimulator<RewardFunctor, InfoFunctor>::StepInfo &info,
+               const bool)
+    {
+        float reward = (info.distanceFromStart - prev_distance_from_start_);
+        prev_distance_from_start_ = info.distanceFromStart;
+
+        return reward;
+    }
+
+    float max_dist_ = 0.0;
+    float prev_distance_from_start_ = 0.0;
+};
+
+using Simulator = BaseSimulator<RewardFunctor, InfoFunctor>;
+}
+
+namespace Exploration {
+struct RewardFunctor;
+
+struct InfoFunctor {
+    struct StepInfo {
+        float numVisited;
+    };
+
+    void update(BaseSimulator<RewardFunctor, InfoFunctor> &sim)
+    {
+        glm::vec3 grid_pos = inverseInitialRotation_ *
+                             (sim.position_ - initialPosition_) / cell_size_;
+
+        visited_set_.emplace(int(grid_pos.x), int(grid_pos.y),
+                             int(grid_pos.z));
+    }
+
+    StepInfo reset(BaseSimulator<RewardFunctor, InfoFunctor> &sim,
+                   esp::nav::PathFinder &)
+    {
+        visited_set_.clear();
+
+        initialPosition_ = sim.position_;
+        inverseInitialRotation_ = glm::inverse(sim.rotation_);
+
+        update(sim);
+
+        return {float(visited_set_.size() - 1)};
+    }
+
+    StepInfo step(BaseSimulator<RewardFunctor, InfoFunctor> &sim,
+                  esp::nav::PathFinder &,
+                  const bool)
+    {
+        if (sim.position_updated_) {
+            update(sim);
+        }
+
+        return {float(visited_set_.size() - 1)};
+    }
+
+    constexpr static float cell_size_ = 1.0;
+
+    glm::vec3 initialPosition_;
+    glm::quat inverseInitialRotation_;
+
+    struct Hasher {
+        static size_t xorshift(const size_t &n, int i) { return n ^ (n >> i); }
+
+        static uint64_t hash(const uint64_t &n)
+        {
+            constexpr uint64_t p =
+                0x5555555555555555;  // pattern of alternating 0 and 1
+            constexpr uint64_t c =
+                17316035218449499591ull;  // random uneven integer constant;
+            return c * xorshift(p * xorshift(n, 32), 32);
+        }
+
+        template <typename T, typename S>
+        typename std::enable_if<std::is_unsigned<T>::value,
+                                T>::type constexpr static rotl(const T n,
+                                                               const S i)
+        {
+            const T m = (std::numeric_limits<T>::digits - 1);
+            const T c = i & m;
+            return (n << c) | (n >> ((T(0) - c) & m));
+        }
+
+        static inline size_t hash_combine(size_t &seed, const int &v)
+        {
+            return rotl(seed, std::numeric_limits<size_t>::digits / 3) ^
+                   hash(*reinterpret_cast<const unsigned int *>(&v));
+        }
+
+        size_t operator()(const std::tuple<int, int, int> &v) const
+        {
+            size_t seed =
+                *reinterpret_cast<const unsigned int *>(&std::get<0>(v));
+            seed = hash_combine(seed, std::get<1>(v));
+            seed = hash_combine(seed, std::get<2>(v));
+            return seed;
+        }
+    };
+
+    std::unordered_set<std::tuple<int, int, int>, Hasher> visited_set_;
+};
+
+struct RewardFunctor {
+    void reset(BaseSimulator<RewardFunctor, InfoFunctor> &,
+               esp::nav::PathFinder &,
+               const InfoFunctor::StepInfo &info)
+    {
+        prev_num_visitied_ = info.numVisited;
+    }
+
+    float step(BaseSimulator<RewardFunctor, InfoFunctor> &,
+               esp::nav::PathFinder &,
+               const BaseSimulator<RewardFunctor, InfoFunctor>::StepInfo &info,
+               const bool)
+    {
+        float reward = 0.25 * (info.numVisited - prev_num_visitied_);
+        prev_num_visitied_ = info.numVisited;
+
+        return reward;
+    }
+
+    float prev_num_visitied_ = 0.0;
+};
+
+using Simulator = BaseSimulator<RewardFunctor, InfoFunctor>;
+}
 
 template <typename T>
 static py::array_t<T> makeFlatNumpyArray(const vector<T> &vec)
@@ -789,9 +1031,11 @@ static py::array_t<T> makeFlatNumpyArray(const vector<T> &vec)
     return py::array_t<T>({vec.size()}, {sizeof(T)}, vec.data(), py::none());
 }
 
+template <class Simulator>
 class EnvironmentGroup;
 class SceneTracker;
 
+template <class Simulator>
 class ThreadEnvironment {
 public:
     ThreadEnvironment(ThreadEnvironment &&) = default;
@@ -807,7 +1051,7 @@ private:
     Simulator *sim_;
     SceneTracker *scene_;
 
-    friend class EnvironmentGroup;
+    friend class EnvironmentGroup<Simulator>;
 };
 
 static uint32_t computeNumLoaderCores(uint32_t num_active_scenes, bool color)
@@ -956,6 +1200,7 @@ private:
     SceneSwapper *swapper_;
 };
 
+template <class Simulator>
 class EnvironmentGroup {
 public:
     EnvironmentGroup(CommandStreamCUDA &strm,
@@ -1027,7 +1272,7 @@ public:
         return makeFlatNumpyArray(masks_);
     }
 
-    py::array_t<StepInfo> getInfos() const
+    py::array_t<typename Simulator::StepInfo> getInfos() const
     {
         return makeFlatNumpyArray(infos_);
     }
@@ -1039,34 +1284,34 @@ public:
                                   &polars_[0].x, py::none());
     }
 
-    ThreadEnvironment makeThreadEnv(uint32_t env_idx)
+    ThreadEnvironment<Simulator> makeThreadEnv(uint32_t env_idx)
     {
-        return ThreadEnvironment(env_idx, sim_states_[env_idx],
-                                 env_scenes_[env_idx]);
+        return ThreadEnvironment<Simulator>(env_idx, sim_states_[env_idx],
+                                            env_scenes_[env_idx]);
     }
 
-    inline bool step(const ThreadEnvironment &env,
+    inline bool step(const ThreadEnvironment<Simulator> &env,
                      vector<esp::nav::PathFinder> &pathfinders,
                      int64_t action)
     {
         return env.sim_->step(action, pathfinders[env.scene_->curScene()]);
     }
 
-    inline void reset(const ThreadEnvironment &env,
+    inline void reset(const ThreadEnvironment<Simulator> &env,
                       vector<esp::nav::PathFinder> &pathfinders,
                       mt19937 &rgen)
     {
         env.sim_->reset(pathfinders[env.scene_->curScene()], rgen);
     }
 
-    bool swapReady(const ThreadEnvironment &env) const
+    bool swapReady(const ThreadEnvironment<Simulator> &env) const
     {
         const auto &scene_tracker = env_scenes_[env.idx_];
         return scene_tracker.getSwapper().getNextScene() != nullptr &&
                !scene_tracker.isConsistent();
     }
 
-    void swapScene(ThreadEnvironment &env)
+    void swapScene(ThreadEnvironment<Simulator> &env)
     {
         auto &scene_tracker = env_scenes_[env.idx_];
         SceneSwapper &swapper = scene_tracker.getSwapper();
@@ -1080,16 +1325,15 @@ public:
 
         auto scene_episodes = dataset_.getEpisodes(scene_idx);
 
-        sim_states_[env.idx_] = Simulator(
-            scene_episodes, render_envs_[env.idx_], getPointers(env.idx_));
+        sim_states_[env.idx_].setEpisode(scene_episodes);
 
         swapper.oneLoaded();
     }
 
 private:
-    ResultPointers getPointers(uint32_t idx)
+    typename Simulator::ResultPointers getPointers(uint32_t idx)
     {
-        return ResultPointers {
+        return typename Simulator::ResultPointers {
             &rewards_[idx],
             &masks_[idx],
             &infos_[idx],
@@ -1104,10 +1348,11 @@ private:
     vector<SceneTracker> env_scenes_;
     vector<float> rewards_;
     vector<uint8_t> masks_;
-    vector<StepInfo> infos_;
+    vector<typename Simulator::StepInfo> infos_;
     vector<glm::vec2> polars_;
 };
 
+template <class Simulator>
 class RolloutGenerator {
 public:
     RolloutGenerator(const string &dataset_path,
@@ -1211,7 +1456,8 @@ public:
         return groups_[group_idx].getMasks();
     }
 
-    py::array_t<StepInfo> getInfos(uint32_t group_idx) const
+    py::array_t<typename Simulator::StepInfo> getInfos(
+        uint32_t group_idx) const
     {
         return groups_[group_idx].getInfos();
     }
@@ -1241,7 +1487,8 @@ public:
         cmd_strm_.waitForFrame(groupIdx);
     }
 
-    void printRendererStats() const {
+    void printRendererStats() const
+    {
         Statistics renderer_stats = renderer_.getStatistics();
 
         cout << "Renderer Statistics -- "
@@ -1412,12 +1659,12 @@ private:
                          mt19937 &rgen)
     {
         const bool trigger_reset = sim_reset_;
-        EnvironmentGroup &group = groups_[active_group_];
+        EnvironmentGroup<Simulator> &group = groups_[active_group_];
 
         uint32_t next_env;
         while ((next_env = next_env_queue_.fetch_add(
                     1, memory_order_acq_rel)) < envs_per_group_) {
-            ThreadEnvironment &env =
+            ThreadEnvironment<Simulator> &env =
                 thread_envs_[next_env + active_group_ * envs_per_group_];
 
             if (trigger_reset) {
@@ -1555,8 +1802,8 @@ private:
 
     mt19937 rgen_;
     DynArray<SceneSwapper> scene_swappers_;
-    vector<EnvironmentGroup> groups_;
-    vector<ThreadEnvironment> thread_envs_;
+    vector<EnvironmentGroup<Simulator>> groups_;
+    vector<ThreadEnvironment<Simulator>> thread_envs_;
     vector<esp::nav::PathFinder> main_thread_pathfinders_;
     const uint32_t wait_target_;
 
@@ -1575,29 +1822,44 @@ private:
     uint64_t num_scenes_swapped_ = 0;
 };
 
-PYBIND11_MODULE(ddppo_fastrollout, m)
+template <class Simulator>
+void make_rollout_gen(py::module &m, const std::string &name)
 {
-    PYBIND11_NUMPY_DTYPE(StepInfo, success, spl, distanceToGoal);
-    py::class_<RolloutGenerator>(m, "RolloutGenerator")
+    using RG = RolloutGenerator<Simulator>;
+
+    py::class_<RG>(m, name.c_str())
         .def(py::init<const string &, const string &, uint32_t, uint32_t, int,
                       int, const array<uint32_t, 2> &, bool, bool, bool,
                       uint64_t, bool>())
         .def(py::init<const string &, const string &, uint32_t, uint32_t, int,
                       int, const array<uint32_t, 2> &, bool, bool, bool,
                       uint64_t>())
-        .def("wait_for_frame", &RolloutGenerator::waitForFrame)
-        .def("step", &RolloutGenerator::step)
-        .def("step_start", &RolloutGenerator::stepStart)
-        .def("step_end", &RolloutGenerator::stepEnd)
-        .def("render", &RolloutGenerator::render)
-        .def("reset", &RolloutGenerator::reset)
-        .def("rgba", &RolloutGenerator::getColorMemory)
-        .def("depth", &RolloutGenerator::getDepthMemory)
-        .def("get_cuda_semaphore", &RolloutGenerator::getCUDASemaphore)
-        .def("get_rewards", &RolloutGenerator::getRewards)
-        .def("get_masks", &RolloutGenerator::getMasks)
-        .def("get_infos", &RolloutGenerator::getInfos)
-        .def("get_polars", &RolloutGenerator::getPolars)
-        .def("print_renderer_stats", &RolloutGenerator::printRendererStats)
-        .def_property_readonly("swap_stats", &RolloutGenerator::swapStats);
+        .def("wait_for_frame", &RG::waitForFrame)
+        .def("step", &RG::step)
+        .def("step_start", &RG::stepStart)
+        .def("step_end", &RG::stepEnd)
+        .def("render", &RG::render)
+        .def("reset", &RG::reset)
+        .def("rgba", &RG::getColorMemory)
+        .def("depth", &RG::getDepthMemory)
+        .def("get_cuda_semaphore", &RG::getCUDASemaphore)
+        .def("get_rewards", &RG::getRewards)
+        .def("get_masks", &RG::getMasks)
+        .def("get_infos", &RG::getInfos)
+        .def("get_polars", &RG::getPolars)
+        .def("print_renderer_stats", &RG::printRendererStats)
+        .def_property_readonly("swap_stats", &RG::swapStats);
+}
+
+PYBIND11_MODULE(ddppo_fastrollout, m)
+{
+    PYBIND11_NUMPY_DTYPE(PointNav::Simulator::StepInfo, success, spl,
+                         distanceToGoal);
+    make_rollout_gen<PointNav::Simulator>(m, "PointNavRolloutGenerator");
+
+    PYBIND11_NUMPY_DTYPE(Flee::Simulator::StepInfo, distanceFromStart);
+    make_rollout_gen<Flee::Simulator>(m, "FleeRolloutGenerator");
+
+    PYBIND11_NUMPY_DTYPE(Exploration::Simulator::StepInfo, numVisited);
+    make_rollout_gen<Exploration::Simulator>(m, "ExplorationRolloutGenerator");
 }
