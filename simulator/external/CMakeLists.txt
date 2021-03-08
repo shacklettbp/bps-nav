@@ -12,7 +12,7 @@ find_package(PythonInterp 3.6 REQUIRED)
 
 message(STATUS "Bindings being generated for python at ${PYTHON_EXECUTABLE}")
 
-add_subdirectory(v4r EXCLUDE_FROM_ALL)
+add_subdirectory(bps3D EXCLUDE_FROM_ALL)
 add_subdirectory(pybind11)
 
 if (NOT TARGET simdjson)

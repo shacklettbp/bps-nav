@@ -26,6 +26,7 @@ class CustomBuilder(build_ext):
             f'-B{self.build_temp}',
             f"-DCMAKE_BUILD_TYPE={build_type}",
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={outdir}",
+            f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={outdir}",
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
         ]
 
@@ -37,10 +38,10 @@ class CustomBuilder(build_ext):
                                "--parallel", str(multiprocessing.cpu_count())])
 
 setup(
-    name="ddppo_fastrollout",
+    name="bps_nav",
     ext_modules=[
         CMakeExtension(
-            name="ddppo_fastrollout"
+            name="bps_nav"
         )
     ],
     cmdclass={"build_ext": CustomBuilder}

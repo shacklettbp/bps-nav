@@ -1,5 +1,5 @@
 /build
-/python/ddppo_fastrollout/*
-!/python/ddppo_fastrollout/setup.py
-/python/pytorch/*
-!/python/pytorch/setup.py
+/simulator/python/bps_nav/*
+!/simulator/python/bps_nav/setup.py
+/simulator/python/pytorch/*
+!/simulator/python/pytorch/setup.py

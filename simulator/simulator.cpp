@@ -1,4 +1,4 @@
-#include <v4r/cuda.hpp>
+#include <bps3D.hpp>
 #include <PathFinder.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -40,7 +40,7 @@ contended_t *__contention(volatile void const *p)
 #undef __NO_SPIN
 
 using namespace std;
-using namespace v4r;
+using namespace bps3D;
 namespace py = pybind11;
 
 namespace SimulatorConfig {
@@ -358,57 +358,34 @@ private:
     vector<SceneMetadata> scenes_;
 };
 
-BatchRendererCUDA makeRenderer(int32_t gpu_id,
-                               uint32_t renderer_batch_size,
-                               uint32_t num_loaders,
-                               const array<uint32_t, 2> &resolution,
-                               bool color,
-                               bool depth,
-                               bool doubleBuffered)
+Renderer makeRenderer(int32_t gpu_id,
+                      uint32_t renderer_batch_size,
+                      uint32_t num_loaders,
+                      const array<uint32_t, 2> &resolution,
+                      bool color,
+                      bool depth,
+                      bool double_buffered)
 {
-    RenderOptions options {};
-    if (doubleBuffered) {
-        options |= RenderOptions::DoubleBuffered;
+    RenderMode mode {};
+    if (color) {
+        mode |= RenderMode::UnlitRGB;
     }
-    // options |= RenderOptions::CpuSynchronization;
 
-    auto make = [&](auto features) {
-        cudaSetDevice(gpu_id);
-        size_t free_gpu_mem, total_gpu_mem;
-        auto res [[maybe_unused]] =
-            cudaMemGetInfo(&free_gpu_mem, &total_gpu_mem);
-        assert(res == cudaSuccess);
+    if (depth) {
+        mode |= RenderMode::Depth;
+    }
 
-        // Leave 1 GiB for non texture stuff. Super scientific.
-        free_gpu_mem -= (1 << 30);
-
-        return BatchRendererCUDA(
-            {
-                gpu_id,       // gpuID
-                num_loaders,  // numLoaders
-                1,            // numStreams
-                renderer_batch_size, resolution[1], resolution[0],
-                // free_gpu_mem,
-                glm::mat4(1, 0, 0, 0, 0, -1.19209e-07, -1, 0, 0, 1,
-                          -1.19209e-07, 0, 0, 0, 0,
-                          1),  // Habitat coordinate txfm matrix
-            },
-            features);
+    RenderConfig cfg {
+        gpu_id,
+        num_loaders,
+        renderer_batch_size,
+        resolution[0],
+        resolution[1],
+        double_buffered,
+        mode,
     };
 
-    if (color && depth) {
-        return make(
-            RenderFeatures<Unlit<RenderOutputs::Color | RenderOutputs::Depth,
-                                 DataSource::Texture>> {options});
-    } else if (color) {
-        return make(
-            RenderFeatures<Unlit<RenderOutputs::Color, DataSource::Texture>> {
-                options});
-    } else {
-        return make(
-            RenderFeatures<Unlit<RenderOutputs::Depth, DataSource::None>> {
-                options});
-    }
+    return Renderer(cfg);
 }
 
 template <typename T>
@@ -1203,13 +1180,13 @@ private:
 template <class Simulator>
 class EnvironmentGroup {
 public:
-    EnvironmentGroup(CommandStreamCUDA &strm,
+    EnvironmentGroup(Renderer &renderer,
                      BackgroundSceneLoader &loader,
                      const Dataset &dataset,
                      uint32_t envs_per_scene,
                      const Span<const uint32_t> &initial_scene_indices,
                      const Span<SceneSwapper> &scene_swappers)
-        : cmd_strm_(strm),
+        : renderer_(renderer),
           dataset_(dataset),
           render_envs_(),
           sim_states_(),
@@ -1236,7 +1213,7 @@ public:
 
             for (uint32_t env_idx = 0; env_idx < envs_per_scene; env_idx++) {
                 render_envs_.emplace_back(
-                    strm.makeEnvironment(scene, 90, 0.1, 1000));
+                    renderer.makeEnvironment(scene, glm::mat4(1.f), 90.f, 0.f, 0.1, 1000));
                 sim_states_.emplace_back(scene_episodes, render_envs_.back(),
                                          getPointers(sim_states_.size()));
                 env_scenes_.emplace_back(&scene_idx, &scene_swapper);
@@ -1260,7 +1237,7 @@ public:
         return {num_scenes, avg_count};
     }
 
-    void render() { cmd_strm_.render(render_envs_); }
+    void render() { renderer_.render(render_envs_.data()); }
 
     py::array_t<float> getRewards() const
     {
@@ -1318,7 +1295,7 @@ public:
         shared_ptr<Scene> scene_data = swapper.getNextScene();
 
         render_envs_[env.idx_] =
-            cmd_strm_.makeEnvironment(move(scene_data), 90, 0.01, 1000);
+            renderer_.makeEnvironment(move(scene_data), glm::mat4(1.f), 90.f, 0.f, 0.01, 1000);
 
         scene_tracker.update();
         uint32_t scene_idx = scene_tracker.curScene();
@@ -1341,7 +1318,7 @@ private:
         };
     };
 
-    CommandStreamCUDA &cmd_strm_;
+    Renderer &renderer_;
     const Dataset &dataset_;
     vector<Environment> render_envs_;
     vector<Simulator> sim_states_;
@@ -1467,34 +1444,19 @@ public:
         return groups_[group_idx].getPolars();
     }
 
-    py::capsule getColorMemory(const uint32_t groupIdx) const
+    py::capsule getColorMemory(const uint32_t groupIdx)
     {
-        return py::capsule(cmd_strm_.getColorDevicePtr(groupIdx));
+        return py::capsule(renderer_.getColorPointer(groupIdx));
     }
 
-    py::capsule getDepthMemory(const uint32_t groupIdx) const
+    py::capsule getDepthMemory(const uint32_t groupIdx)
     {
-        return py::capsule(cmd_strm_.getDepthDevicePtr(groupIdx));
-    }
-
-    py::capsule getCUDASemaphore(const uint32_t groupIdx) const
-    {
-        return py::capsule(cmd_strm_.getCudaSemaphore(groupIdx));
+        return py::capsule(renderer_.getDepthPointer(groupIdx));
     }
 
     void waitForFrame(const uint32_t groupIdx)
     {
-        cmd_strm_.waitForFrame(groupIdx);
-    }
-
-    void printRendererStats() const
-    {
-        Statistics renderer_stats = renderer_.getStatistics();
-
-        cout << "Renderer Statistics -- "
-             << "Input Setup: " << renderer_stats.inputSetup << " "
-             << "Command Record: " << renderer_stats.commandRecord << " "
-             << "Command Submission: " << renderer_stats.renderSubmit << endl;
+        renderer_.waitForFrame(groupIdx);
     }
 
 private:
@@ -1518,7 +1480,6 @@ private:
                                  color,
                                  depth,
                                  num_groups == 2)),
-          cmd_strm_(renderer_.makeCommandStream()),
           envs_per_scene_(num_environments / num_active_scenes),
           envs_per_group_(num_environments / num_groups),
           active_scenes_(),
@@ -1619,7 +1580,7 @@ private:
 
         for (uint32_t i = 0; i < num_groups; i++) {
             groups_.emplace_back(
-                cmd_strm_, scene_swappers_[0].getLoader(), dataset_,
+                renderer_, scene_swappers_[0].getLoader(), dataset_,
                 envs_per_scene_,
                 Span<const uint32_t>(&active_scenes_[i * scenes_per_group],
                                      scenes_per_group),
@@ -1793,8 +1754,7 @@ private:
     }
 
     Dataset dataset_;
-    BatchRendererCUDA renderer_;
-    CommandStreamCUDA cmd_strm_;
+    Renderer renderer_;
     uint32_t envs_per_scene_;
     uint32_t envs_per_group_;
     vector<uint32_t> active_scenes_;
@@ -1842,16 +1802,14 @@ void make_rollout_gen(py::module &m, const std::string &name)
         .def("reset", &RG::reset)
         .def("rgba", &RG::getColorMemory)
         .def("depth", &RG::getDepthMemory)
-        .def("get_cuda_semaphore", &RG::getCUDASemaphore)
         .def("get_rewards", &RG::getRewards)
         .def("get_masks", &RG::getMasks)
         .def("get_infos", &RG::getInfos)
         .def("get_polars", &RG::getPolars)
-        .def("print_renderer_stats", &RG::printRendererStats)
         .def_property_readonly("swap_stats", &RG::swapStats);
 }
 
-PYBIND11_MODULE(ddppo_fastrollout, m)
+PYBIND11_MODULE(bps_nav, m)
 {
     PYBIND11_NUMPY_DTYPE(PointNav::Simulator::StepInfo, success, spl,
                          distanceToGoal);

@@ -1,9 +1,9 @@
-[submodule "external/v4r"]
-	path = external/v4r
-	url = git@github.com:shacklettbp/v4r.git
-[submodule "external/pybind11"]
-	path = external/pybind11
+[submodule "simulator/external/bps3D"]
+	path = simulator/external/bps3D
+	url = https://github.com/shacklettbp/bps3D.git
+[submodule "simulator/external/pybind11"]
+	path = simulator/external/pybind11
 	url = https://github.com/pybind/pybind11.git
-[submodule "external/simdjson"]
-	path = external/simdjson
+[submodule "simulator/external/simdjson"]
+	path = simulator/external/simdjson
 	url = https://github.com/simdjson/simdjson.git
