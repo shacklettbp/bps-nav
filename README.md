@@ -57,7 +57,7 @@ This repository includes a simple script to preprocess all the Gibson and Matter
 
 ```bash
 cd bps-nav
-./scripts/preprocess_datasets.sh 
+./tools/preprocess_datasets.sh 
 ```
 
 The `preprocess_datasets.sh` script also extracts RGB textures for the Gibson dataset into the `textures` directory, which must be compressed, as described in the following section.
@@ -67,7 +67,7 @@ The `preprocess_datasets.sh` script also extracts RGB textures for the Gibson da
 In addition to scene preprocessing, bps3D also requires textures to be block compressed to reduce GPU memory usage. This requires the `toktx` tool from the [KTX-Software repository](https://github.com/KhronosGroup/KTX-Software), which can be built as follows:
 
 ```bash
-git clone --recursive https://https://github.com/KhronosGroup/KTX-Software.git
+git clone --recursive https://github.com/KhronosGroup/KTX-Software.git
 cd KTX-Software
 mkdir build
 cd build
