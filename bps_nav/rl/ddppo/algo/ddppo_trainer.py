@@ -24,7 +24,7 @@ import psutil
 
 #  import v4r_example
 from gym import spaces
-from gym.spaces.dict_space import Dict as SpaceDict
+from gym.spaces import Dict as SpaceDict
 from torch.optim.lr_scheduler import LambdaLR
 
 from habitat import Config, logger, make_dataset
