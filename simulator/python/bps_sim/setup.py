@@ -38,10 +38,10 @@ class CustomBuilder(build_ext):
                                "--parallel", str(multiprocessing.cpu_count())])
 
 setup(
-    name="bps_nav",
+    name="bps_sim",
     ext_modules=[
         CMakeExtension(
-            name="bps_nav"
+            name="bps_sim"
         )
     ],
     cmdclass={"build_ext": CustomBuilder}

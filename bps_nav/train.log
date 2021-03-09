@@ -1,0 +1,21 @@
+2021-03-08 13:31:06,482 agent number of trainable parameters: 10988085
+2021-03-08 13:31:12,104 Inference time: 5.527 ms
+2021-03-08 13:31:12,105 PyTorch CUDA Memory Cache Size: 0.489 GB
+2021-03-08 13:31:28,057 Learning time: 385.147 ms
+2021-03-08 13:31:28,057 Rollout-Step: 5.5384, Inference: 5.5240, Rollouts-Insert: 0.0108, Learning: 15.6705, PPO: 15.6592, Generate-Mini-Batch: 0.2187
+2021-03-08 13:31:28,057 PyTorch CUDA Memory Cache Size: 8.238 GB
+2021-03-08 13:37:44,189 agent number of trainable parameters: 10988085
+2021-03-08 13:37:49,045 Inference time: 5.956 ms
+2021-03-08 13:37:49,045 PyTorch CUDA Memory Cache Size: 0.489 GB
+2021-03-08 13:38:06,673 Learning time: 428.312 ms
+2021-03-08 13:38:06,673 Rollout-Step: 4.7543, Inference: 4.7388, Rollouts-Insert: 0.0116, Learning: 17.3534, PPO: 17.3410, Generate-Mini-Batch: 0.2375
+2021-03-08 13:38:06,673 PyTorch CUDA Memory Cache Size: 8.240 GB
+2021-03-08 13:39:04,355 update: 50	window fps: 15143.888	total fps: 15479.863	frames: 835584
+2021-03-08 13:39:04,355 swap percent: 0.105	scenes in use: 16.000	envs per scene: 32.000
+2021-03-08 13:39:04,356 Average window size: 50  distanceToGoal: 8.557  reward: -0.039  spl: 0.000  success: 0.000
+2021-03-08 13:39:04,356 Rollout-Step: 31.4916, Inference: 10.0893, Rollouts-Insert: 0.6115, Habitat-Step-Start: 0.0652, Habitat-Step-Wait: 1.2702, Renderer-Start: 2.0490, Update-Stats: 0.2418, Renderer-Wait: 17.3339, Learning: 23.5322, Compute-Returns: 0.1261, PPO: 23.1875, Generate-Mini-Batch: 0.4567, Logging: 0.1212
+2021-03-08 13:39:57,172 SLURM_JOBID is none, not saving interrupted state
+2021-03-08 13:39:59,295 update: 100	window fps: 14915.670	total fps: 14921.469	frames: 1654784
+2021-03-08 13:39:59,296 swap percent: 0.105	scenes in use: 27.000	envs per scene: 18.963
+2021-03-08 13:39:59,296 Average window size: 50  distanceToGoal: 8.465  reward: 0.001  spl: 0.000  success: 0.000
+2021-03-08 13:39:59,296 Rollout-Step: 63.0031, Inference: 20.0438, Rollouts-Insert: 1.2602, Habitat-Step-Start: 0.1340, Habitat-Step-Wait: 2.7703, Renderer-Start: 3.6766, Update-Stats: 0.4970, Renderer-Wait: 34.8754, Learning: 46.6403, Compute-Returns: 0.2493, PPO: 46.0273, Generate-Mini-Batch: 0.9162, Logging: 0.1554

@@ -1809,7 +1809,7 @@ void make_rollout_gen(py::module &m, const std::string &name)
         .def_property_readonly("swap_stats", &RG::swapStats);
 }
 
-PYBIND11_MODULE(bps_nav, m)
+PYBIND11_MODULE(bps_sim, m)
 {
     PYBIND11_NUMPY_DTYPE(PointNav::Simulator::StepInfo, success, spl,
                          distanceToGoal);
