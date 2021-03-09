@@ -60,7 +60,7 @@ cd bps-nav
 ./tools/preprocess_datasets.sh 
 ```
 
-The `preprocess_datasets.sh` script also extracts RGB textures for the Gibson dataset into the `textures` directory, which must be compressed, as described in the following section.
+The `preprocess_datasets.sh` script also extracts RGB textures for the Gibson dataset into `bps-nav/textures`, which must be compressed, as described in the following section.
 
 ### Texture Compression
 
