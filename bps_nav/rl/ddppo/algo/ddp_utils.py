@@ -10,7 +10,7 @@ import ifcfg
 import torch
 import torch.distributed as distrib
 
-from habitat import logger
+from bps_nav.common.logger import logger
 
 EXIT = threading.Event()
 EXIT.clear()

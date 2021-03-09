@@ -11,16 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from habitat.tasks.nav.nav import (
-    EpisodicCompassSensor,
-    EpisodicGPSSensor,
-    HeadingSensor,
-    IntegratedPointGoalGPSAndCompassSensor,
-    PointGoalSensor,
-    ProximitySensor,
-)
-from habitat.tasks.nav.object_nav_task import ObjectGoalSensor
-from bps_nav.common.baseline_registry import baseline_registry
 from bps_nav.common.utils import Flatten, ResizeCenterCropper
 from bps_nav.rl.ddppo.policy import regnetx, resnet
 from bps_nav.rl.models.rnn_state_encoder import build_rnn_state_encoder
@@ -48,7 +38,6 @@ def standardize_weights(w):
     return w
 
 
-@baseline_registry.register_policy
 class ResNetPolicy(Policy):
     def __init__(
         self,
@@ -270,56 +259,12 @@ class ResNetNet(Net):
         self._n_prev_action = 32
         rnn_input_size = self._n_prev_action
 
-        if IntegratedPointGoalGPSAndCompassSensor.cls_uuid in observation_space.spaces:
+        if "pointgoal_with_gps_compass" in observation_space.spaces:
             n_input_goal = 3
             self.tgt_embeding = nn.Linear(n_input_goal, 32)
             rnn_input_size += 32
         else:
             self.tgt_embeding = nn.Sequential()
-
-        if ObjectGoalSensor.cls_uuid in observation_space.spaces:
-            self._n_object_categories = (
-                int(observation_space.spaces[ObjectGoalSensor.cls_uuid].high[0]) + 1
-            )
-            self.obj_categories_embedding = nn.Embedding(self._n_object_categories, 32)
-            rnn_input_size += 32
-
-        if EpisodicGPSSensor.cls_uuid in observation_space.spaces:
-            input_gps_dim = observation_space.spaces[EpisodicGPSSensor.cls_uuid].shape[
-                0
-            ]
-            self.gps_embedding = nn.Linear(input_gps_dim, 32)
-            rnn_input_size += 32
-
-        if PointGoalSensor.cls_uuid in observation_space.spaces:
-            input_pointgoal_dim = observation_space.spaces[
-                PointGoalSensor.cls_uuid
-            ].shape[0]
-            self.pointgoal_embedding = nn.Linear(input_pointgoal_dim, 32)
-            rnn_input_size += 32
-
-        if HeadingSensor.cls_uuid in observation_space.spaces:
-            input_heading_dim = (
-                observation_space.spaces[HeadingSensor.cls_uuid].shape[0] + 1
-            )
-            assert input_heading_dim == 2, "Expected heading with 2D rotation."
-            self.heading_embedding = nn.Linear(input_heading_dim, 32)
-            rnn_input_size += 32
-
-        if ProximitySensor.cls_uuid in observation_space.spaces:
-            input_proximity_dim = observation_space.spaces[
-                ProximitySensor.cls_uuid
-            ].shape[0]
-            self.proximity_embedding = nn.Embedding(2, 32)
-            rnn_input_size += 32
-
-        if EpisodicCompassSensor.cls_uuid in observation_space.spaces:
-            assert (
-                observation_space.spaces[EpisodicCompassSensor.cls_uuid].shape[0] == 1
-            ), "Expected compass with 2D rotation."
-            input_compass_dim = 2  # cos and sin of the angle
-            self.compass_embedding = nn.Linear(input_compass_dim, 32)
-            rnn_input_size += 32
 
         self._hidden_size = hidden_size
 

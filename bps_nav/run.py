@@ -10,9 +10,9 @@ import random
 import numpy as np
 import torch
 
-from bps_nav.common.baseline_registry import baseline_registry
 from bps_nav.config.default import get_config
-
+from bps_nav.rl.ddppo.algo import DDPPOTrainer
+from bps_nav.rl.ppo.ppo_trainer import PPOTrainer
 
 def main():
     parser = argparse.ArgumentParser()
@@ -51,15 +51,17 @@ def run_exp(exp_config: str, run_type: str, resume_from=None, opts=None) -> None
     Returns:
         None.
     """
-    config = get_config(exp_config, opts)
+    if run_type == "train":
+        config = get_config(exp_config, opts)
+    elif run_type == "eval":
+        from habitat import get_config as get_config_habitat
+        config = get_config(exp_config, opts, get_config_habitat)
 
     random.seed(config.TASK_CONFIG.SEED)
     np.random.seed(config.TASK_CONFIG.SEED)
     torch.manual_seed(config.TASK_CONFIG.SEED)
 
-    trainer_init = baseline_registry.get_trainer(config.TRAINER_NAME)
-    assert trainer_init is not None, f"{config.TRAINER_NAME} is not supported"
-    trainer = trainer_init(config, resume_from)
+    trainer = DDPPOTrainer(config, resume_from)
 
     if run_type == "train":
         trainer.train()

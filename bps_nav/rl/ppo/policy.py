@@ -11,11 +11,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from habitat.tasks.nav.nav import (
-    IntegratedPointGoalGPSAndCompassSensor,
-    PointGoalSensor,
-)
-from bps_nav.common.baseline_registry import baseline_registry
 from bps_nav.common.utils import CategoricalNet
 from bps_nav.common.running_mean_and_var import RunningMeanAndVar
 from bps_nav.rl.models.rnn_state_encoder import build_rnn_state_encoder
@@ -28,6 +23,8 @@ def _process_depth(
 ) -> Dict[str, torch.Tensor]:
     if "depth" in observations:
         depth_observations = observations["depth"]
+        if depth_observations.shape[1] != 1:
+            depth_observations = depth_observations.permute(0, 3, 1, 2)
 
         depth_observations.clamp_(0.0, 10.0).mul_(1.0 / 10.0)
 
@@ -241,6 +238,9 @@ class Policy(nn.Module):
 
         if "rgb" in observations:
             rgb = observations["rgb"]
+            if rgb.shape[1] != 3:
+                rgb = rgb.permute(0, 3, 1, 2)
+
             rgb.mul_(1.0 / 255.0)
             x = [rgb]
             if "depth" in observations:
@@ -325,21 +325,6 @@ class CriticHead(nn.Module):
     def forward(self, x) -> Dict[str, torch.Tensor]:
         return {"value": self.fc(x)}
 
-
-@baseline_registry.register_policy
-class SimpleCNNPolicy(Policy):
-    goal_sensor_uuid = "pointgoal_with_gps_compass"
-
-    def __init__(
-        self, observation_space, action_space, hidden_size=512, *args, **kwargs
-    ):
-        super().__init__(
-            SimpleCNNNet(observation_space=observation_space, hidden_size=hidden_size),
-            observation_space,
-            action_space.n,
-        )
-
-
 class Net(nn.Module, metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def forward(self, observations, rnn_hidden_states, prev_actions, masks):
@@ -359,64 +344,3 @@ class Net(nn.Module, metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def is_blind(self):
         pass
-
-
-class SimpleCNNNet(Net):
-    r"""Network which passes the input image through CNN and concatenates
-    goal vector with CNN's output and passes that through RNN.
-    """
-
-    def __init__(self, observation_space, hidden_size):
-        super().__init__()
-
-        if IntegratedPointGoalGPSAndCompassSensor.cls_uuid in observation_space.spaces:
-            self._n_input_goal = observation_space.spaces[
-                IntegratedPointGoalGPSAndCompassSensor.cls_uuid
-            ].shape[0]
-        elif PointGoalSensor.cls_uuid in observation_space.spaces:
-            self._n_input_goal = observation_space.spaces[
-                PointGoalSensor.cls_uuid
-            ].shape[0]
-
-        self._hidden_size = hidden_size
-
-        self.visual_encoder = SimpleCNN(observation_space, hidden_size)
-
-        self.state_encoder = RNNStateEncoder(
-            (0 if self.is_blind else self._hidden_size) + self._n_input_goal,
-            self._hidden_size,
-        )
-
-        self.train()
-
-    @property
-    def output_size(self):
-        return self._hidden_size
-
-    @property
-    def is_blind(self):
-        return self.visual_encoder.is_blind
-
-    @property
-    def num_recurrent_layers(self):
-        return self.state_encoder.num_recurrent_layers
-
-    def forward(self, observations, rnn_hidden_states, prev_actions, masks):
-        if IntegratedPointGoalGPSAndCompassSensor.cls_uuid in observations:
-            target_encoding = observations[
-                IntegratedPointGoalGPSAndCompassSensor.cls_uuid
-            ]
-
-        elif PointGoalSensor.cls_uuid in observations:
-            target_encoding = observations[PointGoalSensor.cls_uuid]
-
-        x = [target_encoding]
-
-        if not self.is_blind:
-            perception_embed = self.visual_encoder(observations)
-            x = [perception_embed] + x
-
-        x = torch.cat(x, dim=1)
-        x, rnn_hidden_states = self.state_encoder(x, rnn_hidden_states, masks)
-
-        return x, rnn_hidden_states

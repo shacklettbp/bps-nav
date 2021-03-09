@@ -16,12 +16,8 @@ import torch.nn.functional as F
 import tqdm
 from torch.optim.lr_scheduler import LambdaLR
 
-from habitat import Config, logger
-from habitat.utils.visualizations.utils import observations_to_image
 from bps_nav.common.base_trainer import BaseRLTrainer
-from bps_nav.common.baseline_registry import baseline_registry
 from bps_nav.common.env_utils import construct_envs, construct_envs_habitat
-from bps_nav.common.environments import get_env_class
 from bps_nav.common.rollout_storage import RolloutStorage
 from bps_nav.common.tensorboard_utils import TensorboardWriter
 from bps_nav.common.utils import (
@@ -29,6 +25,7 @@ from bps_nav.common.utils import (
     generate_video,
     linear_decay,
 )
+from bps_nav.common.logger import logger
 from bps_nav.rl.ppo.ppo import PPO
 from bps_nav.common.tree_utils import (
     tree_append_in_place,
@@ -39,6 +36,9 @@ from bps_nav.common.tree_utils import (
     tree_copy_in_place,
 )
 
+from bps_nav.rl.ddppo.policy import ResNetPolicy
+from gym import spaces
+from gym.spaces import Dict as SpaceDict
 
 @torch.jit.script
 def so3_to_matrix(q, m):
@@ -68,7 +68,6 @@ def se3_to_4x4(se3_states):
     return mat
 
 
-@baseline_registry.register_trainer(name="ppo")
 class PPOTrainer(BaseRLTrainer):
     r"""Trainer class for PPO algorithm
     Paper: https://arxiv.org/abs/1707.06347.
@@ -86,7 +85,7 @@ class PPOTrainer(BaseRLTrainer):
         self._static_encoder = False
         self._encoder = None
 
-    def _setup_actor_critic_agent(self, ppo_cfg: Config) -> None:
+    def _setup_actor_critic_agent(self, ppo_cfg) -> None:
         r"""Sets up actor critic and agent for PPO.
 
         Args:
@@ -97,7 +96,7 @@ class PPOTrainer(BaseRLTrainer):
         """
         logger.add_filehandler(self.config.LOG_FILE)
 
-        self.actor_critic = baseline_registry.get_policy(self.config.POLICY_NAME)(
+        self.actor_critic = ResNetPolicy(
             observation_space=observation_space,
             action_space=self.envs.action_spaces[0],
             hidden_size=ppo_cfg.hidden_size,
@@ -438,176 +437,6 @@ class PPOTrainer(BaseRLTrainer):
 
             return losses
 
-    def train(self) -> None:
-        r"""Main method for training PPO.
-
-        Returns:
-            None
-        """
-
-        self.envs = construct_envs(self.config, get_env_class(self.config.ENV_NAME))
-
-        ppo_cfg = self.config.RL.PPO
-        self.device = (
-            torch.device("cuda", self.config.TORCH_GPU_ID)
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
-        if not os.path.isdir(self.config.CHECKPOINT_FOLDER):
-            os.makedirs(self.config.CHECKPOINT_FOLDER)
-        self._setup_actor_critic_agent(ppo_cfg)
-        logger.info(
-            "agent number of parameters: {}".format(
-                sum(param.numel() for param in self.agent.parameters())
-            )
-        )
-
-        rollouts = RolloutStorage(
-            ppo_cfg.num_steps,
-            self.envs.num_envs,
-            self.envs.observation_spaces[0],
-            self.envs.action_spaces[0],
-            ppo_cfg.hidden_size,
-        )
-        rollouts.to(self.device)
-
-        observations = self.envs.reset()
-        batch = batch_obs(observations, device=self.device)
-
-        for sensor in rollouts.observations:
-            rollouts.observations[sensor][0].copy_(batch[sensor])
-
-        # batch and observations may contain shared PyTorch CUDA
-        # tensors.  We must explicitly clear them here otherwise
-        # they will be kept in memory for the entire duration of training!
-        batch = None
-        observations = None
-
-        current_episode_reward = torch.zeros(self.envs.num_envs, 1)
-        running_episode_stats = dict(
-            count=torch.zeros(self.envs.num_envs, 1),
-            reward=torch.zeros(self.envs.num_envs, 1),
-        )
-        window_episode_stats = defaultdict(
-            lambda: deque(maxlen=ppo_cfg.reward_window_size)
-        )
-
-        t_start = time.time()
-        env_time = 0
-        pth_time = 0
-        count_steps = 0
-        count_checkpoints = 0
-        update = 0
-
-        lr_scheduler = LambdaLR(
-            optimizer=self.agent.optimizer,
-            lr_lambda=lambda x: linear_decay(
-                self.percent_done(update, count_steps),
-                final_decay=ppo_cfg.decay_factor,
-            )
-            if ppo_cfg.use_linear_lr_decay
-            else 1.0,
-        )
-
-        with TensorboardWriter(
-            self.config.TENSORBOARD_DIR, flush_secs=self.flush_secs
-        ) as writer:
-            while not self.is_done(update, count_steps):
-                if ppo_cfg.use_linear_clip_decay:
-                    self.agent.clip_param = ppo_cfg.clip_param * linear_decay(
-                        self.percent_done(update, count_steps),
-                        final_decay=ppo_cfg.decay_factor,
-                    )
-
-                self.actor_critic.eval()
-                for step in range(ppo_cfg.num_steps):
-                    (
-                        delta_pth_time,
-                        delta_env_time,
-                        delta_steps,
-                    ) = self._collect_rollout_step(
-                        rollouts, current_episode_reward, running_episode_stats
-                    )
-                    pth_time += delta_pth_time
-                    env_time += delta_env_time
-                    count_steps += delta_steps
-
-                (
-                    delta_pth_time,
-                    value_loss,
-                    action_loss,
-                    dist_entropy,
-                ) = self._update_agent(ppo_cfg, rollouts)
-                lr_scheduler.step()
-                pth_time += delta_pth_time
-
-                for k, v in running_episode_stats.items():
-                    window_episode_stats[k].append(v.clone())
-
-                deltas = {
-                    k: (
-                        (v[-1] - v[0]).sum().item() if len(v) > 1 else v[0].sum().item()
-                    )
-                    for k, v in window_episode_stats.items()
-                }
-                deltas["count"] = max(deltas["count"], 1.0)
-
-                writer.add_scalar(
-                    "reward", deltas["reward"] / deltas["count"], count_steps
-                )
-
-                # Check to see if there are any metrics
-                # that haven't been logged yet
-                metrics = {
-                    k: v / deltas["count"]
-                    for k, v in deltas.items()
-                    if k not in {"reward", "count"}
-                }
-                if len(metrics) > 0:
-                    writer.add_scalars("metrics", metrics, count_steps)
-
-                losses = [value_loss, action_loss]
-                writer.add_scalars(
-                    "losses",
-                    {k: l for l, k in zip(losses, ["value", "policy"])},
-                    count_steps,
-                )
-
-                # log stats
-                if update > 0 and update % self.config.LOG_INTERVAL == 0:
-                    logger.info(
-                        "update: {}\tfps: {:.3f}\t".format(
-                            update, count_steps / (time.time() - t_start)
-                        )
-                    )
-
-                    logger.info(
-                        "update: {}\tenv-time: {:.3f}s\tpth-time: {:.3f}s\t"
-                        "frames: {}".format(update, env_time, pth_time, count_steps)
-                    )
-
-                    logger.info(
-                        "Average window size: {}  {}".format(
-                            len(window_episode_stats["count"]),
-                            "  ".join(
-                                "{}: {:.3f}".format(k, v / deltas["count"])
-                                for k, v in deltas.items()
-                                if k != "count"
-                            ),
-                        )
-                    )
-
-                # checkpoint model
-                if self.should_checkpoint(update, count_steps):
-                    self.save_checkpoint(
-                        f"ckpt.{count_checkpoints}.pth", dict(step=count_steps)
-                    )
-                    count_checkpoints += 1
-
-                update += 1
-
-            self.envs.close()
-
     def _eval_checkpoint(
         self,
         checkpoint_path: str,
@@ -624,6 +453,9 @@ class PPOTrainer(BaseRLTrainer):
         Returns:
             None
         """
+
+        from habitat_baselines.common.environments import get_env_class
+
         # Map location CPU is almost always better than mapping to a CUDA device.
         ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
 
@@ -648,7 +480,40 @@ class PPOTrainer(BaseRLTrainer):
 
         #  logger.info(f"env config: {config}")
         self.envs = construct_envs_habitat(config, get_env_class(config.ENV_NAME))
-        self.observation_space = self.envs.observation_spaces[0]
+        self.observation_space = SpaceDict(
+            {
+                "pointgoal_with_gps_compass": spaces.Box(
+                    low=0.0, high=1.0, shape=(2,), dtype=np.float32
+                )
+            }
+        )
+
+        if self.config.COLOR:
+            self.observation_space = SpaceDict(
+                {
+                    "rgb": spaces.Box(
+                        low=np.finfo(np.float32).min,
+                        high=np.finfo(np.float32).max,
+                        shape=(3, *self.config.RESOLUTION),
+                        dtype=np.uint8,
+                    ),
+                    **self.observation_space.spaces,
+                }
+            )
+
+        if self.config.DEPTH:
+            self.observation_space = SpaceDict(
+                {
+                    "depth": spaces.Box(
+                        low=np.finfo(np.float32).min,
+                        high=np.finfo(np.float32).max,
+                        shape=(1, *self.config.RESOLUTION),
+                        dtype=np.float32,
+                    ),
+                    **self.observation_space.spaces,
+                }
+            )
+
         self.action_space = self.envs.action_spaces[0]
         self._setup_actor_critic_agent(ppo_cfg)
 

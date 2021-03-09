@@ -18,8 +18,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 from gym.spaces import Box
 
-from habitat import logger
-from habitat.utils.visualizations.utils import images_to_video
 from bps_nav.common.tensorboard_utils import TensorboardWriter
 
 

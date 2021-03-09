@@ -6,11 +6,11 @@
 
 import os.path as osp
 from typing import List, Optional, Union
+from bps_nav.config import Config
 
 import numpy as np
 
-from habitat import get_config as get_task_config
-from habitat.config import Config as CN
+CN = Config
 
 MODULE_DIR = osp.dirname(osp.dirname(osp.dirname(__file__)))
 
@@ -35,6 +35,7 @@ _C.VIDEO_DIR = "video_dir"
 _C.TEST_EPISODE_COUNT = -1
 _C.EVAL_CKPT_PATH_DIR = "data/checkpoints"  # path to ckpt or path to ckpts dir
 _C.NUM_PROCESSES = 16
+_C.SIM_BATCH_SIZE = 128
 _C.SENSORS = ["RGB_SENSOR", "DEPTH_SENSOR"]
 _C.CHECKPOINT_FOLDER = "data/checkpoints"
 _C.NUM_UPDATES = -1
@@ -116,33 +117,142 @@ _C.RL.DDPPO.use_batch_norm = False
 _C.RL.DDPPO.resnet_baseplanes = 32
 _C.RL.DDPPO.step_ramp = 5000
 _C.RL.DDPPO.step_ramp_start = 2
-# -----------------------------------------------------------------------------
-# ORBSLAM2 BASELINE
-# -----------------------------------------------------------------------------
-_C.ORBSLAM2 = CN()
-_C.ORBSLAM2.SLAM_VOCAB_PATH = "bps_nav/slambased/data/ORBvoc.txt"
-_C.ORBSLAM2.SLAM_SETTINGS_PATH = "bps_nav/slambased/data/mp3d3_small1k.yaml"
-_C.ORBSLAM2.MAP_CELL_SIZE = 0.1
-_C.ORBSLAM2.MAP_SIZE = 40
-_C.ORBSLAM2.CAMERA_HEIGHT = get_task_config().SIMULATOR.DEPTH_SENSOR.POSITION[1]
-_C.ORBSLAM2.BETA = 100
-_C.ORBSLAM2.H_OBSTACLE_MIN = 0.3 * _C.ORBSLAM2.CAMERA_HEIGHT
-_C.ORBSLAM2.H_OBSTACLE_MAX = 1.0 * _C.ORBSLAM2.CAMERA_HEIGHT
-_C.ORBSLAM2.D_OBSTACLE_MIN = 0.1
-_C.ORBSLAM2.D_OBSTACLE_MAX = 4.0
-_C.ORBSLAM2.PREPROCESS_MAP = True
-_C.ORBSLAM2.MIN_PTS_IN_OBSTACLE = get_task_config().SIMULATOR.DEPTH_SENSOR.WIDTH / 2.0
-_C.ORBSLAM2.ANGLE_TH = float(np.deg2rad(15))
-_C.ORBSLAM2.DIST_REACHED_TH = 0.15
-_C.ORBSLAM2.NEXT_WAYPOINT_TH = 0.5
-_C.ORBSLAM2.NUM_ACTIONS = 3
-_C.ORBSLAM2.DIST_TO_STOP = 0.05
-_C.ORBSLAM2.PLANNER_MAX_STEPS = 500
-_C.ORBSLAM2.DEPTH_DENORM = get_task_config().SIMULATOR.DEPTH_SENSOR.MAX_DEPTH
 
+def get_task_config(
+    config_paths: Optional[Union[List[str], str]] = None,
+    opts: Optional[list] = None,
+) -> CN:
+    r"""Create a unified config with default values overwritten by values from
+    :p:`config_paths` and overwritten by options from :p:`opts`.
+
+    :param config_paths: List of config paths or string that contains comma
+        separated list of config paths.
+    :param opts: Config options (keys, values) in a list (e.g., passed from
+        command line into the config. For example,
+        :py:`opts = ['FOO.BAR', 0.5]`. Argument can be used for parameter
+        sweeping or quick tests.
+    """
+
+    config = CN()
+
+    config.SEED = 100
+    config.ENVIRONMENT = CN()
+    config.ENVIRONMENT.MAX_EPISODE_STEPS = 1000
+    config.ENVIRONMENT.MAX_EPISODE_SECONDS = 10000000
+    config.ENVIRONMENT.ITERATOR_OPTIONS = CN()
+    config.ENVIRONMENT.ITERATOR_OPTIONS.CYCLE = True
+    config.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = True
+    config.ENVIRONMENT.ITERATOR_OPTIONS.GROUP_BY_SCENE = True
+    config.ENVIRONMENT.ITERATOR_OPTIONS.NUM_EPISODE_SAMPLE = -1
+    config.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_EPISODES = -1
+    config.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = int(1e4)
+    config.ENVIRONMENT.ITERATOR_OPTIONS.STEP_REPETITION_RANGE = 0.2
+    config.TASK = CN()
+    config.TASK.TYPE = "Nav-v0"
+    config.TASK.SUCCESS_DISTANCE = 0.2
+    config.TASK.SENSORS = []
+    config.TASK.MEASUREMENTS = []
+    config.TASK.GOAL_SENSOR_UUID = "pointgoal"
+    config.TASK.POSSIBLE_ACTIONS = ["STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"]
+
+    ACTIONS = CN()
+    ACTIONS.STOP = CN()
+    ACTIONS.STOP.TYPE = "StopAction"
+    ACTIONS.MOVE_FORWARD = CN()
+    ACTIONS.MOVE_FORWARD.TYPE = "MoveForwardAction"
+    ACTIONS.TURN_LEFT = CN()
+    ACTIONS.TURN_LEFT.TYPE = "TurnLeftAction"
+    ACTIONS.TURN_RIGHT = CN()
+    ACTIONS.TURN_RIGHT.TYPE = "TurnRightAction"
+    ACTIONS.LOOK_UP = CN()
+    ACTIONS.LOOK_UP.TYPE = "LookUpAction"
+    ACTIONS.LOOK_DOWN = CN()
+    ACTIONS.LOOK_DOWN.TYPE = "LookDownAction"
+    ACTIONS.TELEPORT = CN()
+    ACTIONS.TELEPORT.TYPE = "TeleportAction"
+    
+    config.TASK.ACTIONS = ACTIONS
+    config.TASK.POINTGOAL_SENSOR = CN()
+    config.TASK.POINTGOAL_SENSOR.TYPE = "PointGoalSensor"
+    config.TASK.POINTGOAL_SENSOR.GOAL_FORMAT = "POLAR"
+    config.TASK.POINTGOAL_SENSOR.DIMENSIONALITY = 2
+    config.TASK.POINTGOAL_WITH_GPS_COMPASS_SENSOR = config.TASK.POINTGOAL_SENSOR.clone()
+    config.TASK.POINTGOAL_WITH_GPS_COMPASS_SENSOR.TYPE = (
+        "PointGoalWithGPSCompassSensor"
+    )
+
+    config.TASK.SUCCESS = CN()
+    config.TASK.SUCCESS.TYPE = "Success"
+    config.TASK.SUCCESS.SUCCESS_DISTANCE = 0.2
+    config.TASK.SPL = CN()
+    config.TASK.SPL.TYPE = "SPL"
+
+    config.SIMULATOR = CN()
+    config.SIMULATOR.TYPE = "Sim-v0"
+    config.SIMULATOR.ACTION_SPACE_CONFIG = "v0"
+    config.SIMULATOR.FORWARD_STEP_SIZE = 0.25  # in metres
+    config.SIMULATOR.DEFAULT_AGENT_ID = 0
+
+    SIMULATOR_SENSOR = CN()
+    SIMULATOR_SENSOR.HEIGHT = 480
+    SIMULATOR_SENSOR.WIDTH = 640
+    SIMULATOR_SENSOR.HFOV = 90  # horizontal field of view in degrees
+    SIMULATOR_SENSOR.POSITION = [0, 1.25, 0]
+    SIMULATOR_SENSOR.ORIENTATION = [0.0, 0.0, 0.0]  # Euler's angles
+
+    config.SIMULATOR.RGB_SENSOR = SIMULATOR_SENSOR.clone()
+    config.SIMULATOR.RGB_SENSOR.TYPE = "HabitatSimRGBSensor"
+    config.SIMULATOR.DEPTH_SENSOR = SIMULATOR_SENSOR.clone()
+    config.SIMULATOR.DEPTH_SENSOR.TYPE = "HabitatSimDepthSensor"
+    config.SIMULATOR.DEPTH_SENSOR.MIN_DEPTH = 0.0
+    config.SIMULATOR.DEPTH_SENSOR.MAX_DEPTH = 10.0
+    config.SIMULATOR.DEPTH_SENSOR.NORMALIZE_DEPTH = True
+
+    config.SIMULATOR.AGENT_0 = CN()
+    config.SIMULATOR.AGENT_0.HEIGHT = 1.5
+    config.SIMULATOR.AGENT_0.RADIUS = 0.1
+    config.SIMULATOR.AGENT_0.MASS = 32.0
+    config.SIMULATOR.AGENT_0.LINEAR_ACCELERATION = 20.0
+    config.SIMULATOR.AGENT_0.ANGULAR_ACCELERATION = 4 * 3.14
+    config.SIMULATOR.AGENT_0.LINEAR_FRICTION = 0.5
+    config.SIMULATOR.AGENT_0.ANGULAR_FRICTION = 1.0
+    config.SIMULATOR.AGENT_0.COEFFICIENT_OF_RESTITUTION = 0.0
+    config.SIMULATOR.AGENT_0.SENSORS = ["RGB_SENSOR"]
+    config.SIMULATOR.AGENT_0.IS_SET_START_STATE = False
+    config.SIMULATOR.AGENT_0.START_POSITION = [0, 0, 0]
+    config.SIMULATOR.AGENT_0.START_ROTATION = [0, 0, 0, 1]
+    config.SIMULATOR.AGENTS = ["AGENT_0"]
+    config.SIMULATOR.HABITAT_SIM_V0 = CN()
+    config.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = 0
+    config.SIMULATOR.HABITAT_SIM_V0.GPU_GPU = False
+    config.DATASET = CN()
+    config.DATASET.TYPE = "PointNav-v1"
+    config.DATASET.SPLIT = "train"
+    config.DATASET.SCENES_DIR = "data/scene_datasets"
+    config.DATASET.CONTENT_SCENES = ["*"]
+    config.DATASET.DATA_PATH = (
+        "data/datasets/pointnav/habitat-test-scenes/v1/{split}/{split}.json.gz"
+)
+
+    if config_paths:
+        if isinstance(config_paths, str):
+            if CONFIG_FILE_SEPARATOR in config_paths:
+                config_paths = config_paths.split(CONFIG_FILE_SEPARATOR)
+            else:
+                config_paths = [config_paths]
+
+        for config_path in config_paths:
+            config.merge_from_file(config_path)
+
+    if opts:
+        config.merge_from_list(opts)
+
+    config.freeze()
+    return config
 
 def get_config(
     config_paths: Optional[Union[List[str], str]] = None, opts: Optional[list] = None,
+    get_task_config_override = None,
 ) -> CN:
     r"""Create a unified config with default values overwritten by values from
     :ref:`config_paths` and overwritten by options from :ref:`opts`.
@@ -172,7 +282,10 @@ def get_config(
             if k == "BASE_TASK_CONFIG_PATH":
                 config.BASE_TASK_CONFIG_PATH = v
 
-    config.TASK_CONFIG = get_task_config(config.BASE_TASK_CONFIG_PATH)
+    if get_task_config_override != None:
+        config.TASK_CONFIG = get_task_config_override(config.BASE_TASK_CONFIG_PATH)
+    else:
+        config.TASK_CONFIG = get_task_config(config.BASE_TASK_CONFIG_PATH)
     if opts:
         config.CMD_TRAILING_OPTS = config.CMD_TRAILING_OPTS + opts
         config.merge_from_list(config.CMD_TRAILING_OPTS)

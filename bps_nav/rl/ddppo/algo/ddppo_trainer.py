@@ -27,10 +27,7 @@ from gym import spaces
 from gym.spaces import Dict as SpaceDict
 from torch.optim.lr_scheduler import LambdaLR
 
-from habitat import Config, logger, make_dataset
-from bps_nav.common.baseline_registry import baseline_registry
 from bps_nav.common.env_utils import construct_envs
-from bps_nav.common.environments import get_env_class
 from bps_nav.common.rollout_storage import DoubleBufferedRolloutStorage
 from bps_nav.common.tensorboard_utils import TensorboardWriter
 from bps_nav.common.utils import Timing, batch_obs, linear_decay
@@ -51,6 +48,8 @@ from bps_nav.common.tree_utils import (
 from bps_nav.rl.ppo.ppo_trainer import PPOTrainer
 from bps_nav.rl.ddppo.policy.resnet import Dropblock
 import socket
+from bps_nav.common.logger import logger
+from bps_nav.rl.ddppo.policy import ResNetPolicy
 
 try:
     import psutil
@@ -65,9 +64,9 @@ torch.backends.cudnn.deterministic = False
 
 BURN_IN_UPDATES = 50
 
-V4R_BENCHMARK = os.environ.get("V4R_BENCHMARK", "0") != "0"
+BPS_BENCHMARK = os.environ.get("BPS_BENCHMARK", "0") != "0"
 
-if V4R_BENCHMARK:
+if BPS_BENCHMARK:
     logger.warn("In benchmark mode")
 
 
@@ -112,7 +111,7 @@ def set_cpus(local_rank, world_size):
         for ind in sorted(pop_inds, reverse=True):
             local_cpus.pop(ind)
 
-        if V4R_BENCHMARK and world_size == 1:
+        if BPS_BENCHMARK and world_size == 1:
             local_cpus = total_cpus[0:12]
 
         curr_process.cpu_affinity(local_cpus)
@@ -122,7 +121,6 @@ def set_cpus(local_rank, world_size):
     )
 
 
-@baseline_registry.register_trainer(name="ddppo")
 class DDPPOTrainer(PPOTrainer):
     # DD-PPO cuts rollouts short to mitigate the straggler effect
     # This, in theory, can cause some rollouts to be very short.
@@ -140,7 +138,7 @@ class DDPPOTrainer(PPOTrainer):
 
         super().__init__(config)
 
-    def _setup_actor_critic_agent(self, ppo_cfg: Config) -> None:
+    def _setup_actor_critic_agent(self, ppo_cfg) -> None:
         r"""Sets up actor critic and agent for DD-PPO.
 
         Args:
@@ -151,7 +149,12 @@ class DDPPOTrainer(PPOTrainer):
         """
         logger.add_filehandler(self.config.LOG_FILE)
 
-        self.actor_critic = baseline_registry.get_policy(self.config.POLICY_NAME)(
+        if hasattr(self.config.RL.DDPPO, 'use_avg_pool'):
+            use_avg_pool = self.config.RL.DDPPO.use_avg_pool
+        else:
+            use_avg_pool = False
+
+        self.actor_critic = ResNetPolicy(
             observation_space=self.observation_space,
             action_space=self.action_space,
             hidden_size=ppo_cfg.hidden_size,
@@ -159,7 +162,7 @@ class DDPPOTrainer(PPOTrainer):
             num_recurrent_layers=self.config.RL.DDPPO.num_recurrent_layers,
             backbone=self.config.RL.DDPPO.backbone,
             resnet_baseplanes=self.config.RL.DDPPO.resnet_baseplanes,
-            use_avg_pool=self.config.RL.DDPPO.use_avg_pool,
+            use_avg_pool=use_avg_pool,
         )
         self.actor_critic.to(self.device)
 
@@ -177,7 +180,7 @@ class DDPPOTrainer(PPOTrainer):
             )
         elif self.config.RL.DDPPO.pretrained_encoder:
             prefix = "actor_critic.net.visual_encoder."
-            self.actor_criticac.ac.net.visual_encoder.load_state_dict(
+            self.actor_critic.ac.net.visual_encoder.load_state_dict(
                 {
                     k[len(prefix) :]: v
                     for k, v in pretrained_state["state_dict"].items()
@@ -352,7 +355,7 @@ class DDPPOTrainer(PPOTrainer):
         self.config.TORCH_GPU_ID = self.local_rank
         self.config.SIMULATOR_GPU_ID = self.local_rank
         # Multiply by the number of simulators to make sure they also get unique seeds
-        self.config.TASK_CONFIG.SEED += self.world_rank * self.config.NUM_PROCESSES
+        self.config.TASK_CONFIG.SEED += self.world_rank * self.config.SIM_BATCH_SIZE
         self.config.freeze()
 
         random.seed(self.config.TASK_CONFIG.SEED)
@@ -426,7 +429,7 @@ class DDPPOTrainer(PPOTrainer):
             max(
                 np.sqrt(
                     ppo_cfg.num_steps
-                    * self.config.NUM_PROCESSES
+                    * self.config.SIM_BATCH_SIZE
                     * ppo_cfg.num_accumulate_steps
                     / ppo_cfg.num_mini_batch
                     * self.world_size
@@ -477,8 +480,8 @@ class DDPPOTrainer(PPOTrainer):
         if interrupted_state is not None:
             self.agent.load_state_dict(interrupted_state["state_dict"])
 
-        self.agent.init_amp(self.config.NUM_PROCESSES)
-        self.actor_critic.init_trt(self.config.NUM_PROCESSES)
+        self.agent.init_amp(self.config.SIM_BATCH_SIZE)
+        self.actor_critic.init_trt(self.config.SIM_BATCH_SIZE)
         self.actor_critic.script_net()
         self.agent.init_distributed(find_unused_params=False)
 
@@ -509,7 +512,7 @@ class DDPPOTrainer(PPOTrainer):
             with torch.no_grad():
                 batch["visual_features"] = self._encoder(batch)
 
-        nenvs = self.config.NUM_PROCESSES
+        nenvs = self.config.SIM_BATCH_SIZE
         rollouts = DoubleBufferedRolloutStorage(
             ppo_cfg.num_steps,
             nenvs,
@@ -571,7 +574,7 @@ class DDPPOTrainer(PPOTrainer):
                 slice(
                     start_ind,
                     start_ind
-                    + self.config.NUM_PROCESSES // (2 if double_buffered else 1),
+                    + self.config.SIM_BATCH_SIZE // (2 if double_buffered else 1),
                 )
             )
 
@@ -620,7 +623,7 @@ class DDPPOTrainer(PPOTrainer):
                     )
 
                 if (
-                    not V4R_BENCHMARK
+                    not BPS_BENCHMARK
                     and (REQUEUE.is_set() or ((self.update + 1) % 100) == 0)
                     and self.world_rank == 0
                 ):

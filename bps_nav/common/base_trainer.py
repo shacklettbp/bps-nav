@@ -10,9 +10,9 @@ from typing import ClassVar, Dict, List
 
 import torch
 
-from habitat import Config, logger
 from bps_nav.common.tensorboard_utils import TensorboardWriter
 from bps_nav.common.utils import poll_checkpoint_folder
+from bps_nav.common.logger import logger
 
 
 class BaseTrainer:
@@ -41,11 +41,10 @@ class BaseRLTrainer(BaseTrainer):
     methods should be hosted here.
     """
     device: torch.device
-    config: Config
     video_option: List[str]
     _flush_secs: int
 
-    def __init__(self, config: Config):
+    def __init__(self, config):
         super().__init__()
         assert config is not None, "needs config file to initialize trainer"
         self.config = config
@@ -154,7 +153,7 @@ class BaseRLTrainer(BaseTrainer):
 
                     self.prev_ckpt_ind += 1
 
-    def _setup_eval_config(self, checkpoint_config: Config) -> Config:
+    def _setup_eval_config(self, checkpoint_config):
         r"""Sets up and returns a merged config for evaluation. Config
             object saved from checkpoint is merged into config file specified
             at evaluation time with the following overwrite priority:

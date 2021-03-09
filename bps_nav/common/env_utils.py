@@ -14,9 +14,6 @@ from collections import OrderedDict
 
 import numpy as np
 import torch
-import habitat
-from habitat import Config, Env, RLEnv, VectorEnv, make_dataset
-
 
 try:
     import psutil
@@ -33,23 +30,12 @@ class Sync:
         self._envs.wait_for_frame(self._idx)
 
 def construct_envs(
-    config: Config, num_worker_groups: int = 4, double_buffered: bool = True,
-) -> VectorEnv:
-    r"""Create VectorEnv object with specified config and env class type.
-    To allow better performance, dataset are split into small ones for
-    each individual env, grouped by scenes.
-
-    :param config: configs that contain num_processes as well as information
-    :param necessary to create individual environments.
-    :param env_class: class type of the envs to be created.
-    :param workers_ignore_signals: Passed to :ref:`habitat.VectorEnv`'s constructor
-
-    :return: VectorEnv object created according to specification.
-    """
+    config, num_worker_groups: int = 4, double_buffered: bool = True,
+):
     import bps_sim 
     import bps_pytorch
 
-    num_processes = config.NUM_PROCESSES
+    batch_size = config.SIM_BATCH_SIZE
     num_workers = -1
 
     episodes_folder = osp.join(
@@ -75,7 +61,7 @@ def construct_envs(
     envs = envs_class(
         episodes_folder,
         "data/v4r_scene_datasets",
-        num_processes,
+        batch_size,
         num_worker_groups,
         num_workers,
         config.SIMULATOR_GPU_ID,
@@ -100,7 +86,7 @@ def construct_envs(
             observation["rgb"] = bps_pytorch.make_color_tensor(
                 envs.rgba(i),
                 config.SIMULATOR_GPU_ID,
-                num_processes // (2 if double_buffered else 1),
+                batch_size // (2 if double_buffered else 1),
                 config.RESOLUTION,
             )[..., 0:3].permute(0, 3, 1, 2)
 
@@ -108,7 +94,7 @@ def construct_envs(
             observation["depth"] = bps_pytorch.make_depth_tensor(
                 envs.depth(i),
                 config.SIMULATOR_GPU_ID,
-                num_processes // (2 if double_buffered else 1),
+                batch_size // (2 if double_buffered else 1),
                 config.RESOLUTION,
             ).unsqueeze(1)
 
@@ -132,33 +118,11 @@ def construct_envs(
     return (envs, observations, rewards, masks, infos, syncs)
 
 
-def make_env_fn(
-    config: Config, env_class: Type[Union[Env, RLEnv]]
-) -> Union[Env, RLEnv]:
-    r"""Creates an env of type env_class with specified config and rank.
-    This is to be passed in as an argument when creating VectorEnv.
-
-    Args:
-        config: root exp config that has core env config node as well as
-            env-specific config node.
-        env_class: class type of the env to be created.
-
-    Returns:
-        env object created according to specification.
-    """
-    dataset = make_dataset(
-        config.TASK_CONFIG.DATASET.TYPE, config=config.TASK_CONFIG.DATASET
-    )
-    env = env_class(config=config, dataset=dataset)
-    env.seed(config.TASK_CONFIG.SEED)
-    return env
-
-
 def construct_envs_habitat(
-    config: Config,
-    env_class: Type[Union[Env, RLEnv]],
+    config,
+    env_class,
     workers_ignore_signals: bool = False,
-) -> VectorEnv:
+):
     r"""Create VectorEnv object with specified config and env class type.
     To allow better performance, dataset are split into small ones for
     each individual env, grouped by scenes.
@@ -170,6 +134,10 @@ def construct_envs_habitat(
 
     :return: VectorEnv object created according to specification.
     """
+
+    import habitat
+    from habitat import make_dataset
+    from habitat_baselines.utils.env_utils import make_env_fn
 
     num_processes = config.NUM_PROCESSES
     configs = []
