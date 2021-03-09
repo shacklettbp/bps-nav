@@ -60,7 +60,7 @@ def construct_envs(
 
     envs = envs_class(
         episodes_folder,
-        "data/v4r_scene_datasets",
+        "data/scene_datasets",
         batch_size,
         num_worker_groups,
         num_workers,
