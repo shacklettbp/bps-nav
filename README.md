@@ -34,7 +34,7 @@ cd simulator/python/bps_sim
 pip install -e . # Build simulator
 cd ../bps_pytorch
 pip install -e . # Build pytorch integration
-cd ../../
+cd ../../../
 pip install -e . # Install main bps_nav module
 mkdir data # Create data directory for datasets, model checkpoints etc.
 ```
